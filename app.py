@@ -11,7 +11,6 @@ import random
 # ==========================================
 st.set_page_config(page_title="献立＆買出しアプリ", layout="wide", initial_sidebar_state="collapsed")
 
-# スマホアプリ化のためのUI最適化（タブの上部固定など）
 st.markdown("""
     <style>
     /* タブメニューを画面上部に固定 */
@@ -24,12 +23,10 @@ st.markdown("""
         padding-bottom: 5px;
         border-bottom: 1px solid #e6e6e6;
     }
-    /* モバイルでの余白を最適化 */
     .block-container {
         padding-top: 2rem !important;
         padding-bottom: 5rem !important;
     }
-    /* DAYバッジの装飾 */
     .day-badge {
         color: white; 
         background-color: #E03C31; 
@@ -63,7 +60,7 @@ with st.sidebar:
         st.warning("⚠️ APIキーが未設定です")
     selected_model = "gemini-3.1-flash-lite"
 
-# セッション状態の初期化 (マスト消費を廃止)
+# セッション状態の初期化
 if "inventory_df" not in st.session_state:
     st.session_state.inventory_df = pd.DataFrame([
         {"食材名": "豚肉", "カテゴリ": "精肉", "残量": 200.0, "単位": "g", "購入日": datetime.date.today() - datetime.timedelta(days=4)},
@@ -160,9 +157,9 @@ def toggle_recipe(idx):
         st.session_state.selected_order.append(idx)
 
 # ==========================================
-# UI: タブ構成
+# UI: タブ構成 (5タブに拡張)
 # ==========================================
-tab_create, tab_home, tab_shop, tab_inv = st.tabs(["⚙️ 献立作成", "📅 献立確定", "🛒 買出し", "📦 在庫"])
+tab_create, tab_home, tab_shop, tab_consume, tab_inv = st.tabs(["⚙️ 献立作成", "📅 献立確定", "🛒 買出し", "🍳 個別消費", "📦 在庫管理"])
 
 # ------------------------------------------
 # Tab 1: 献立作成
@@ -192,20 +189,32 @@ with tab_create:
         req_prompt = f"以下のリクエストに基づき、合計 {target_days * 2}品 のお米に合う夕食レシピを考案してください。\n【リクエスト】\n{requests_list}\n"
 
     if st.button("✨ レシピ案を生成", type="primary", use_container_width=True):
-        with st.spinner("AIがレシピを考案中..."):
+        with st.spinner("AIが詳細なレシピを考案中..."):
             sys_prompt = """
-            あなたはプロの料理研究家です。条件に基づき、以下のJSON配列のみを出力してください。
-            ・食材（肉・野菜・メインの魚など）の単位は厳密に統一してください。
-            ・米、油、塩こしょう、醤油などの「調味料・基本食材」は、分量不要で "seasonings" 配列に入れてください。
-            ・手順(steps)は、下ごしらえ、切り方、火加減、炒める順番など「具体的に詳細に」記述してください（最低5ステップ以上）。
+            あなたはプロの料理研究家です。条件に基づき、以下のJSON配列のフォーマットを【厳密に】守って出力してください。
+            ・調味料は「炒め用」「下味」「合わせ調味料」など用途別に連想配列で分類してください。
+            ・手順やポイントは、必ず「見出し(title)」と「詳細説明(desc)」のセットにしてください。
+            
             [
               {
-                "name": "料理名", "intro": "紹介文", 
-                "ingredients": {"豚肉": 200, "キャベツ": 1}, 
-                "unit_map": {"豚肉": "g", "キャベツ": "玉"}, 
-                "seasonings": ["醤油", "みりん", "酒", "塩こしょう", "サラダ油"],
-                "steps": ["1. 豚肉は3cm幅に切り、塩こしょうで下味をつける。", "2. フライパンにサラダ油を中火で熱し..."], 
-                "tips": ["ポイント1"]
+                "name": "豚こまとズッキーニ、舞茸のガリバタ醤油炒め",
+                "intro": "豚こま肉の旨味、ズッキーニのジューシーさ...ご飯のおかずにもぴったりの一品です。",
+                "ingredients": {"豚こま切れ肉": 200, "ズッキーニ": 1, "舞茸": 1},
+                "unit_map": {"豚こま切れ肉": "g", "ズッキーニ": "本", "舞茸": "パック"},
+                "seasonings": {
+                  "炒め用・その他": ["にんにく（みじん切り）", "バター", "サラダ油"],
+                  "豚肉の下味": ["酒", "塩こしょう", "片栗粉"],
+                  "合わせ調味料": ["醤油", "みりん"]
+                },
+                "steps": [
+                  {"title": "具材の下準備", "desc": "ズッキーニは縦半分に切り、幅1cmほどの半月切りにします。舞茸は石づきを取り..."},
+                  {"title": "豚肉の下処理", "desc": "豚こま切れ肉はボウルに入れ、下味の酒、塩こしょうを揉み込みます..."},
+                  {"title": "香りを出して豚肉を炒める", "desc": "フライパンにサラダ油とみじん切りにしたにんにくを入れて弱火にかけます..."}
+                ],
+                "tips": [
+                  {"title": "お肉に片栗粉をまぶす", "desc": "豚肉がパサつかず柔らかく仕上がるだけでなく、タレがしっかり絡むようになります。"},
+                  {"title": "ズッキーニの焼き加減", "desc": "ズッキーニは少し焼き色がつくくらいまでしっかり炒めると、中がトロッとジューシーに仕上がります。"}
+                ]
               }
             ]
             """
@@ -253,31 +262,46 @@ with tab_home:
             with st.expander(f"Day {i+1}: {r['name']}", expanded=(i==0)):
                 st.markdown(f"*{r.get('intro', '')}*")
                 
-                # 画面を圧迫しないよう、モバイル向けに縦並びを意識
-                st.markdown("#### 🔪 材料（2人分）")
-                for ing, amt in r.get("ingredients", {}).items():
-                    unit = r.get("unit_map", {}).get(ing, "")
-                    inv_amt = float(inv_total.get(ing, 0))
-                    if inv_amt < float(amt):
-                        st.error(f"- {ing}: {amt} {unit} ⚠️不足 (在庫: {inv_amt}{unit})")
-                    else:
-                        st.write(f"- {ing}: {amt} {unit}")
+                col_left, col_right = st.columns(2)
+                with col_left:
+                    st.markdown("#### 🔪 材料（2人分）")
+                    for ing, amt in r.get("ingredients", {}).items():
+                        unit = r.get("unit_map", {}).get(ing, "")
+                        inv_amt = float(inv_total.get(ing, 0))
+                        if inv_amt < float(amt):
+                            st.error(f"- **{ing}**: {amt} {unit} ⚠️不足 (在庫: {inv_amt}{unit})")
+                        else:
+                            st.write(f"- **{ing}**: {amt} {unit}")
                 
-                st.markdown("#### 🧂 調味料・基本食材")
-                st.caption("※分量管理なし。有無のチェック用")
-                cols = st.columns(3) # 調味料は横に並べて省スペース化
-                for idx, s in enumerate(r.get("seasonings", [])):
-                    with cols[idx % 3]:
-                        st.checkbox(s, key=f"seasoning_{i}_{s}")
+                with col_right:
+                    st.markdown("#### 🧂 調味料・基本食材")
+                    st.caption("※分量管理なし。有無のチェック用")
+                    seasonings = r.get("seasonings", {})
+                    if isinstance(seasonings, dict):
+                        for cat_name, items in seasonings.items():
+                            st.markdown(f"**【{cat_name}】**")
+                            for s in items:
+                                st.checkbox(s, key=f"seasoning_{i}_{cat_name}_{s}")
+                    elif isinstance(seasonings, list):
+                        for s in seasonings:
+                            st.checkbox(s, key=f"seasoning_{i}_{s}")
                         
-                st.markdown("#### 🍳 詳細手順")
-                for step in r.get("steps", []): st.write(f"{step}")
+                st.markdown("#### 🍳 作り方")
+                for step_idx, step in enumerate(r.get("steps", [])): 
+                    if isinstance(step, dict):
+                        st.markdown(f"**{step_idx+1}. {step.get('title', '')}**")
+                        st.write(f"{step.get('desc', '')}")
+                    else:
+                        st.write(f"- {step}")
                     
                 if r.get("tips"):
-                    st.markdown("#### 💡 ポイント")
-                    for tip in r.get("tips", []): st.info(tip)
+                    st.markdown("#### 💡 美味しく作るためのポイント")
+                    for tip in r.get("tips", []): 
+                        if isinstance(tip, dict):
+                            st.markdown(f"- **{tip.get('title', '')}**: {tip.get('desc', '')}")
+                        else:
+                            st.info(tip)
                 
-                # 調理完了（FIFO一括消費）
                 st.write("")
                 if st.button(f"👩‍🍳 Day {i+1} 調理完了 (在庫から減算)", key=f"consume_btn_{i}", type="secondary", use_container_width=True):
                     consume_fifo(r.get("ingredients", {}))
@@ -364,31 +388,36 @@ with tab_shop:
                 st.session_state.inventory_df = inv_df
                 st.success(f"追加完了: {', '.join(added_str)}")
 
+
 # ------------------------------------------
-# Tab 4: 食材管理
+# Tab 4: 個別消費 (専用画面)
 # ------------------------------------------
-with tab_inv:
-    st.header("📦 食材管理表")
+with tab_consume:
+    st.header("🍳 個別消費")
+    st.caption("夕食の献立以外（朝食やお弁当など）で使った食材をここで記録します。購入日が古いものから自動で減算（FIFO）されます。")
     
-    st.subheader("🗑 サクッと個別消費")
-    st.caption("お弁当などで使った食材を素早く減算。古い購入日のものから自動消化（FIFO）されます。")
-    cols_c = st.columns([4, 3, 3])
-    
-    unique_items = sorted(st.session_state.inventory_df["食材名"].unique().tolist())
-    with cols_c[0]:
-        consume_target = st.selectbox("食材", unique_items if unique_items else ["(なし)"])
-    with cols_c[1]:
-        consume_amt = st.number_input("消費量", min_value=0.1, value=1.0, step=0.5)
-    with cols_c[2]:
+    with st.container(border=True):
+        unique_items = sorted(st.session_state.inventory_df["食材名"].unique().tolist())
+        
+        cols_c = st.columns([1, 1])
+        with cols_c[0]:
+            consume_target = st.selectbox("🍎 どの食材を使いましたか？", unique_items if unique_items else ["(在庫なし)"])
+        with cols_c[1]:
+            consume_amt = st.number_input("⚖️ 使った量", min_value=0.1, value=1.0, step=0.5)
+            
         st.write("") 
-        if st.button("減算", type="secondary", use_container_width=True) and unique_items:
+        if st.button("一括で消費を記録する", type="primary", use_container_width=True) and unique_items:
             consume_fifo({consume_target: consume_amt})
-            st.success(f"{consume_target} を消費しました。")
+            st.success(f"✅ {consume_target} を {consume_amt} 消費しました。")
             st.rerun()
 
-    st.divider()
-
-    st.caption("👇 直接編集・削除も可能です（Excelライク）")
+# ------------------------------------------
+# Tab 5: 食材管理
+# ------------------------------------------
+with tab_inv:
+    st.header("📦 在庫管理表")
+    st.caption("直接編集・削除が可能です。※同じ食材でも購入日が異なれば別行として管理されます。")
+    
     old_names = st.session_state.inventory_df["食材名"].tolist()
     
     edited_inv_main = st.data_editor(

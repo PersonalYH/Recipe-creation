@@ -11,26 +11,23 @@ import random
 # ==========================================
 st.set_page_config(page_title="1週間献立＆買出し自動化", layout="wide", initial_sidebar_state="expanded")
 
-@st.cache_data(show_spinner=False)
-def fetch_available_models(key):
-    for version in ["v1", "v1beta"]:
-        url = f"https://generativelanguage.googleapis.com/{version}/models?key={key}"
-        res = requests.get(url)
-        if res.status_code == 200:
-            models = res.json().get("models", [])
-            return [m["name"].replace("models/", "") for m in models if "generateContent" in m.get("supportedGenerationMethods", []) and "2.5" not in m["name"]]
-    return []
-
+# サイドバー設定（Secretsからの自動読み込み対応）
 with st.sidebar:
     st.header("🔑 システム設定")
-    api_key = st.text_input("Gemini API Key", type="password")
-    selected_model = None
+    
+    # Streamlitの安全な保管庫(Secrets)にキーがあれば自動設定、なければ手入力枠を表示
+    if "GEMINI_API_KEY" in st.secrets:
+        api_key = st.secrets["GEMINI_API_KEY"]
+        st.success("✅ APIキー自動読み込み完了")
+    else:
+        api_key = st.text_input("Gemini API Key", type="password")
+        st.warning("⚠️ APIキーが未設定です")
+        
+    # ご指定のモデルに固定
+    selected_model = "gemini-3.1-flash-lite"
+    
     if api_key:
-        available_models = fetch_available_models(api_key)
-        if available_models:
-            st.success("✅ 認証成功")
-            default_idx = next((i for i, m in enumerate(available_models) if "1.5-flash" in m), 0)
-            selected_model = st.selectbox("🤖 使用モデル", available_models, index=default_idx)
+        st.info(f"🤖 使用モデル:\n{selected_model}")
 
 # セッション状態の初期化
 if "inventory_df" not in st.session_state:
@@ -67,7 +64,7 @@ STAPLE_ITEMS = [
 # ==========================================
 def generate_via_gemini(prompt, key, model_name, sys_prompt):
     if not key or not model_name:
-        st.error("APIキーとモデルを設定してください。")
+        st.error("APIキーが設定されていません。")
         return None
     payload = {"contents": [{"parts": [{"text": sys_prompt + "\n\n" + prompt}]}]}
     headers = {'Content-Type': 'application/json'}

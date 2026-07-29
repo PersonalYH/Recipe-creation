@@ -5,6 +5,8 @@ import json
 import difflib
 import datetime
 import random
+import io
+import msal
 
 # ==========================================
 # 0. 初期設定 & モバイル最適化CSS
@@ -49,6 +51,63 @@ def fetch_available_models(key):
             return [m["name"].replace("models/", "") for m in models if "generateContent" in m.get("supportedGenerationMethods", []) and "2.5" not in m["name"]]
     return []
 
+# ==========================================
+# 1. 認証 ＆ OneDrive(Excel) 同期システム
+# ==========================================
+def get_ms_access_token():
+    """リフレッシュトークンを使って新しいアクセスパスポートを発行"""
+    client_id = st.secrets["MS_CLIENT_ID"]
+    client_secret = st.secrets["MS_CLIENT_SECRET"]
+    refresh_token = st.secrets["MS_REFRESH_TOKEN"]
+    authority = "https://login.microsoftonline.com/consumers"
+    
+    app = msal.ConfidentialClientApplication(client_id, authority=authority, client_credential=client_secret)
+    result = app.acquire_token_by_refresh_token(refresh_token, scopes=["Files.ReadWrite"])
+    return result.get("access_token")
+
+def save_to_excel(inv_df, shop_df):
+    """PandasのデータをOneDriveのExcelに上書き保存"""
+    token = get_ms_access_token()
+    if not token: return False
+    
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    }
+    
+    # メモリ上でExcelファイルを作成
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine='openpyxl') as writer:
+        inv_df.to_excel(writer, sheet_name="Inventory", index=False)
+        shop_df.to_excel(writer, sheet_name="ShoppingList", index=False)
+    output.seek(0)
+    
+    # OneDriveのルートディレクトリに MealAppDB.xlsx という名前で保存/上書き
+    url = "https://graph.microsoft.com/v1.0/me/drive/root:/MealAppDB.xlsx:/content"
+    res = requests.put(url, headers=headers, data=output.read())
+    return res.status_code in [200, 201]
+
+def load_from_excel():
+    """OneDriveのExcelからデータを読み込む"""
+    token = get_ms_access_token()
+    if not token: return None, None
+    
+    headers = {"Authorization": f"Bearer {token}"}
+    url = "https://graph.microsoft.com/v1.0/me/drive/root:/MealAppDB.xlsx:/content"
+    res = requests.get(url, headers=headers)
+    
+    if res.status_code == 200:
+        excel_data = io.BytesIO(res.content)
+        inv_df = pd.read_excel(excel_data, sheet_name="Inventory")
+        shop_df = pd.read_excel(excel_data, sheet_name="ShoppingList")
+        # 日付型を復元
+        inv_df['購入日'] = pd.to_datetime(inv_df['購入日']).dt.date
+        return inv_df, shop_df
+    return None, None # ファイルが存在しない場合
+
+# ==========================================
+# 2. アプリの起動とデータ初期化
+# ==========================================
 # APIキー管理
 with st.sidebar:
     st.header("🔑 システム設定")
@@ -58,20 +117,38 @@ with st.sidebar:
     else:
         api_key = st.text_input("Gemini API Key", type="password")
         st.warning("⚠️ APIキーが未設定です")
+        
+    if "MS_REFRESH_TOKEN" in st.secrets:
+        st.success("✅ OneDrive 同期稼働中")
+    
+    if st.button("🔄 クラウドから最新データを強制再読込"):
+        st.session_state.data_loaded = False
+        st.rerun()
+        
     selected_model = "gemini-3.1-flash-lite"
 
-# セッション状態の初期化
-if "inventory_df" not in st.session_state:
-    st.session_state.inventory_df = pd.DataFrame([
-        {"食材名": "豚肉", "カテゴリ": "精肉", "残量": 200.0, "単位": "g", "購入日": datetime.date.today() - datetime.timedelta(days=4)},
-        {"食材名": "キャベツ", "カテゴリ": "青果", "残量": 1.0, "単位": "玉", "購入日": datetime.date.today()},
-        {"食材名": "玉ねぎ", "カテゴリ": "青果", "残量": 3.0, "単位": "個", "購入日": datetime.date.today() - datetime.timedelta(days=6)},
-        {"食材名": "卵", "カテゴリ": "日配品", "残量": 4.0, "単位": "個", "購入日": datetime.date.today() - datetime.timedelta(days=2)},
-        {"食材名": "牛乳", "カテゴリ": "日配品", "残量": 0.5, "単位": "本", "購入日": datetime.date.today() - datetime.timedelta(days=3)}
-    ])
+# アプリ起動時に一度だけOneDriveから読み込む
+if "data_loaded" not in st.session_state or not st.session_state.data_loaded:
+    with st.spinner("☁️ OneDriveからデータを同期しています..."):
+        inv_df, shop_df = load_from_excel()
+        
+        if inv_df is not None:
+            st.session_state.inventory_df = inv_df
+            st.session_state.shopping_list_df = shop_df
+        else:
+            # 初回起動時（Excelがない場合）は初期データを作成してOneDriveに保存
+            st.session_state.inventory_df = pd.DataFrame([
+                {"食材名": "豚肉", "カテゴリ": "精肉", "残量": 200.0, "単位": "g", "購入日": datetime.date.today() - datetime.timedelta(days=4)},
+                {"食材名": "キャベツ", "カテゴリ": "青果", "残量": 1.0, "単位": "玉", "購入日": datetime.date.today()},
+                {"食材名": "玉ねぎ", "カテゴリ": "青果", "残量": 3.0, "単位": "個", "購入日": datetime.date.today() - datetime.timedelta(days=6)},
+                {"食材名": "卵", "カテゴリ": "日配品", "残量": 4.0, "単位": "個", "購入日": datetime.date.today() - datetime.timedelta(days=2)},
+                {"食材名": "牛乳", "カテゴリ": "日配品", "残量": 0.5, "単位": "本", "購入日": datetime.date.today() - datetime.timedelta(days=3)}
+            ])
+            st.session_state.shopping_list_df = pd.DataFrame(columns=["買出済", "食材名", "カテゴリ", "必要量", "単位", "確定献立のDAY", "確定献立のレシピ名"])
+            save_to_excel(st.session_state.inventory_df, st.session_state.shopping_list_df)
+            
+        st.session_state.data_loaded = True
 
-if "shopping_list_df" not in st.session_state:
-    st.session_state.shopping_list_df = pd.DataFrame(columns=["買出済", "食材名", "カテゴリ", "必要量", "単位", "確定献立のDAY", "確定献立のレシピ名"])
 if "draft_plan" not in st.session_state:
     st.session_state.draft_plan = []
 if "final_plan" not in st.session_state:
@@ -88,7 +165,7 @@ STAPLE_ITEMS = [
 ]
 
 # ==========================================
-# 1. ユーティリティ関数
+# 3. ユーティリティ関数
 # ==========================================
 def generate_via_gemini(prompt, key, model_name, sys_prompt):
     if not key or not model_name:
@@ -129,10 +206,18 @@ def calculate_shopping_list(plan_list):
                 "買出済": False, "食材名": ing, "カテゴリ": "その他", "必要量": shortage, "単位": data["unit"], 
                 "確定献立のDAY": ", ".join(sorted(data["days"])), "確定献立のレシピ名": ", ".join(data["recipes"])
             })
-    st.session_state.shopping_list_df = pd.DataFrame(shop_data) if shop_data else pd.DataFrame(columns=["買出済", "食材名", "カテゴリ", "必要量", "単位", "確定献立のDAY", "確定献立のレシピ名"])
+    
+    if shop_data:
+        new_df = pd.DataFrame(shop_data)
+        st.session_state.shopping_list_df = pd.concat([st.session_state.shopping_list_df, new_df], ignore_index=True)
+    else:
+        # 新規追加がない場合は空のDataFrameを維持するなどの処理
+        pass
+        
+    save_to_excel(st.session_state.inventory_df, st.session_state.shopping_list_df) # 同期
 
 def consume_fifo(ingredients_dict):
-    """FIFO（古い購入日から順に消費）で在庫を減算"""
+    """FIFO（古い購入日から順に消費）で在庫を減算しクラウド同期"""
     df = st.session_state.inventory_df
     for ing, required_amt in ingredients_dict.items():
         remaining_to_consume = float(required_amt)
@@ -149,6 +234,7 @@ def consume_fifo(ingredients_dict):
                 remaining_to_consume = 0.0
                 
     st.session_state.inventory_df = df[df["残量"] > 0].reset_index(drop=True)
+    save_to_excel(st.session_state.inventory_df, st.session_state.shopping_list_df) # 同期
 
 def toggle_recipe(idx):
     if idx in st.session_state.selected_order:
@@ -247,6 +333,7 @@ with tab_create:
                 st.session_state.draft_plan = []
                 st.session_state.selected_order = []
                 st.success("確定しました！「献立確定」タブへ移動してください。")
+                st.rerun()
 
 # ------------------------------------------
 # Tab 2: 献立確定
@@ -305,7 +392,7 @@ with tab_home:
                 st.write("")
                 if st.button(f"👩‍🍳 Day {i+1} 調理完了 (在庫から減算)", key=f"consume_btn_{i}", type="secondary", use_container_width=True):
                     consume_fifo(r.get("ingredients", {}))
-                    st.success("古い在庫から順に材料を差し引きました！")
+                    st.success("古い在庫から順に材料を差し引き、クラウドに同期しました！")
                     st.rerun()
 
 # ------------------------------------------
@@ -325,6 +412,8 @@ with tab_shop:
                     st.session_state.shopping_list_df = pd.concat([st.session_state.shopping_list_df, new_row], ignore_index=True)
                     added += 1
         st.success(f"{added}件の定番アイテムを追加しました。" if added > 0 else "ストックは十分です。")
+        if added > 0:
+            save_to_excel(st.session_state.inventory_df, st.session_state.shopping_list_df)
 
     if len(st.session_state.shopping_list_df) == 0:
         st.info("買い出しが必要な食材はありません。")
@@ -341,7 +430,11 @@ with tab_shop:
             key="editor_shop",
             use_container_width=True
         )
-        st.session_state.shopping_list_df = edited_shop
+        
+        # もしリストの内容（カテゴリ修正や行追加など）が変更されたら保存
+        if not edited_shop.equals(st.session_state.shopping_list_df):
+            st.session_state.shopping_list_df = edited_shop
+            save_to_excel(st.session_state.inventory_df, st.session_state.shopping_list_df)
 
         if st.button("✅ チェック済みの品を在庫へ反映", type="primary", use_container_width=True):
             purchased = edited_shop[edited_shop["買出済"] == True]
@@ -360,7 +453,8 @@ with tab_shop:
                         inv_df = pd.concat([inv_df, new_row], ignore_index=True)
                 st.session_state.inventory_df = inv_df
                 st.session_state.shopping_list_df = pending
-                st.success("在庫に追加しました！")
+                save_to_excel(st.session_state.inventory_df, st.session_state.shopping_list_df)
+                st.success("在庫に追加し、クラウドに保存しました！")
                 st.rerun()
 
     st.divider()
@@ -386,8 +480,8 @@ with tab_shop:
                         inv_df = pd.concat([inv_df, new_row], ignore_index=True)
                     added_str.append(f"{ing_name}({item.get('amount')}{item.get('unit')})")
                 st.session_state.inventory_df = inv_df
-                st.success(f"追加完了: {', '.join(added_str)}")
-
+                save_to_excel(st.session_state.inventory_df, st.session_state.shopping_list_df)
+                st.success(f"追加完了（クラウド保存済）: {', '.join(added_str)}")
 
 # ------------------------------------------
 # Tab 4: 個別消費 (専用画面)
@@ -408,7 +502,7 @@ with tab_consume:
         st.write("") 
         if st.button("一括で消費を記録する", type="primary", use_container_width=True) and unique_items:
             consume_fifo({consume_target: consume_amt})
-            st.success(f"✅ {consume_target} を {consume_amt} 消費しました。")
+            st.success(f"✅ {consume_target} を {consume_amt} 消費し、クラウドに保存しました。")
             st.rerun()
 
 # ------------------------------------------
@@ -440,4 +534,8 @@ with tab_inv:
             if matches:
                 st.warning(f"⚠️ 表記ゆれアラート: 追加された「{added_item[0]}」は、登録済みの「{matches[0]}」と統合できる可能性があります。")
                 
-    st.session_state.inventory_df = edited_inv_main
+    # ユーザーが表を直接編集した場合、クラウドに上書き保存
+    if not edited_inv_main.equals(st.session_state.inventory_df):
+        st.session_state.inventory_df = edited_inv_main
+        save_to_excel(st.session_state.inventory_df, st.session_state.shopping_list_df)
+        st.success("☁️ クラウドに変更を保存しました！")

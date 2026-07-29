@@ -4,7 +4,6 @@ import requests
 import json
 import difflib
 import datetime
-import random
 import io
 import msal
 
@@ -15,527 +14,408 @@ st.set_page_config(page_title="献立＆買出しアプリ", layout="wide", init
 
 st.markdown("""
     <style>
-    /* タブメニューを画面上部に固定 */
     div[data-testid="stTabs"] > div:nth-child(1) {
-        position: sticky;
-        top: 0;
-        z-index: 999;
-        background-color: white;
-        padding-top: 10px;
-        padding-bottom: 5px;
-        border-bottom: 1px solid #e6e6e6;
+        position: sticky; top: 0; z-index: 999; background-color: white;
+        padding-top: 10px; padding-bottom: 5px; border-bottom: 1px solid #e6e6e6;
     }
-    .block-container {
-        padding-top: 2rem !important;
-        padding-bottom: 5rem !important;
-    }
-    .day-badge {
-        color: white; 
-        background-color: #E03C31; 
-        padding: 3px 8px; 
-        border-radius: 4px; 
-        font-size: 0.85em; 
-        font-weight: bold;
-        margin-right: 8px;
-    }
+    .block-container { padding-top: 2rem !important; padding-bottom: 5rem !important; }
+    .day-badge { color: white; background-color: #E03C31; padding: 3px 8px; border-radius: 4px; font-size: 0.85em; font-weight: bold; margin-right: 8px; }
+    .st-emotion-cache-1v0mbdj { margin-top: -15px; } /* UIの隙間微調整 */
     </style>
 """, unsafe_allow_html=True)
 
-@st.cache_data(show_spinner=False)
-def fetch_available_models(key):
-    for version in ["v1", "v1beta"]:
-        url = f"https://generativelanguage.googleapis.com/{version}/models?key={key}"
-        res = requests.get(url)
-        if res.status_code == 200:
-            models = res.json().get("models", [])
-            return [m["name"].replace("models/", "") for m in models if "generateContent" in m.get("supportedGenerationMethods", []) and "2.5" not in m["name"]]
-    return []
+# 定数
+UNIT_OPTIONS = ["g", "個", "玉", "本", "束", "パック", "枚", "ml"]
+CATEGORY_OPTIONS = ["青果", "精肉", "鮮魚", "日配品", "加工食品", "調味料", "その他"]
+SHEETS = ["Inventory", "ShoppingList", "Staples", "Seasonings", "PremadeSauces", "TransactionLog", "Ratings"]
 
 # ==========================================
-# 1. 認証 ＆ OneDrive(Excel) 同期システム
+# 1. ユーティリティ & AI (Gemini)
+# ==========================================
+def generate_via_gemini(prompt, sys_prompt=""):
+    key = st.secrets.get("GEMINI_API_KEY")
+    if not key: return None
+    payload = {"contents": [{"parts": [{"text": sys_prompt + "\n\n" + prompt}]}]}
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={key}"
+    try:
+        res = requests.post(url, headers={'Content-Type': 'application/json'}, json=payload)
+        if res.status_code == 200:
+            text = res.json()["candidates"][0]["content"]["parts"][0]["text"]
+            text = text.replace("```json", "").replace("```", "").strip()
+            return json.loads(text) if text.startswith("[") or text.startswith("{") else text
+    except Exception:
+        pass
+    return None
+
+# ==========================================
+# 2. 認証 ＆ OneDrive(Excel) 同期システム
 # ==========================================
 def get_ms_access_token():
-    """リフレッシュトークンを使って新しいアクセスパスポートを発行"""
     client_id = st.secrets["MS_CLIENT_ID"]
     client_secret = st.secrets["MS_CLIENT_SECRET"]
     refresh_token = st.secrets["MS_REFRESH_TOKEN"]
-    authority = "https://login.microsoftonline.com/consumers"
-    
-    app = msal.ConfidentialClientApplication(client_id, authority=authority, client_credential=client_secret)
-    result = app.acquire_token_by_refresh_token(refresh_token, scopes=["Files.ReadWrite"])
-    return result.get("access_token")
+    app = msal.ConfidentialClientApplication(client_id, authority="https://login.microsoftonline.com/consumers", client_credential=client_secret)
+    return app.acquire_token_by_refresh_token(refresh_token, scopes=["Files.ReadWrite"]).get("access_token")
 
-def save_to_excel(inv_df, shop_df):
-    """PandasのデータをOneDriveのExcelに上書き保存"""
+def save_to_excel():
     token = get_ms_access_token()
     if not token: return False
-    
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Content-Type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-    }
-    
-    # メモリ上でExcelファイルを作成
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine='openpyxl') as writer:
-        inv_df.to_excel(writer, sheet_name="Inventory", index=False)
-        shop_df.to_excel(writer, sheet_name="ShoppingList", index=False)
+        for sheet in SHEETS:
+            df = st.session_state.get(f"df_{sheet}", pd.DataFrame())
+            df.to_excel(writer, sheet_name=sheet, index=False)
     output.seek(0)
-    
-    # OneDriveのルートディレクトリに MealAppDB.xlsx という名前で保存/上書き
     url = "https://graph.microsoft.com/v1.0/me/drive/root:/MealAppDB.xlsx:/content"
-    res = requests.put(url, headers=headers, data=output.read())
-    return res.status_code in [200, 201]
+    requests.put(url, headers={"Authorization": f"Bearer {token}", "Content-Type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"}, data=output.read())
 
 def load_from_excel():
-    """OneDriveのExcelからデータを読み込む"""
     token = get_ms_access_token()
-    if not token: return None, None
-    
-    headers = {"Authorization": f"Bearer {token}"}
+    if not token: return False
     url = "https://graph.microsoft.com/v1.0/me/drive/root:/MealAppDB.xlsx:/content"
-    res = requests.get(url, headers=headers)
+    res = requests.get(url, headers={"Authorization": f"Bearer {token}"})
     
     if res.status_code == 200:
         excel_data = io.BytesIO(res.content)
-        inv_df = pd.read_excel(excel_data, sheet_name="Inventory")
-        shop_df = pd.read_excel(excel_data, sheet_name="ShoppingList")
-        # 日付型を復元
-        inv_df['購入日'] = pd.to_datetime(inv_df['購入日']).dt.date
-        return inv_df, shop_df
-    return None, None # ファイルが存在しない場合
+        for sheet in SHEETS:
+            try:
+                df = pd.read_excel(excel_data, sheet_name=sheet)
+                if '購入日' in df.columns: df['購入日'] = pd.to_datetime(df['購入日']).dt.date
+                if '日時' in df.columns: df['日時'] = pd.to_datetime(df['日時'])
+                st.session_state[f"df_{sheet}"] = df
+            except: pass
+        return True
+    return False
 
 # ==========================================
-# 2. アプリの起動とデータ初期化
+# 3. Siri用 API バックドア (ハンズフリー機能)
 # ==========================================
-# APIキー管理
+# iOSショートカットから /?api=siri&q=質問内容 でアクセスされた場合の隠し処理
+if st.query_params.get("api") == "siri":
+    query = st.query_params.get("q", "現在の在庫状況を教えて")
+    load_from_excel()
+    # 全データをJSON化してAIに渡し、Siri向けの短文回答を生成
+    db_context = {s: st.session_state.get(f"df_{s}", pd.DataFrame()).to_dict(orient="records") for s in SHEETS}
+    sys_prompt = "あなたはユーザーの家事サポートAIです。提供されたJSONデータベースに基づき、ユーザーの質問に音声読み上げに適した【短く簡潔な日本語】で回答してください。挨拶不要。"
+    prompt = f"【データベース】\n{json.dumps(db_context, ensure_ascii=False)}\n\n【ユーザーの質問】\n{query}"
+    answer = generate_via_gemini(prompt, sys_prompt)
+    st.json({"answer": answer if answer else "エラーが発生しました"})
+    st.stop()
+
+# ==========================================
+# 4. データ初期化 & ロジック
+# ==========================================
 with st.sidebar:
     st.header("🔑 システム設定")
-    if "GEMINI_API_KEY" in st.secrets:
-        api_key = st.secrets["GEMINI_API_KEY"]
-        st.success("✅ APIキー自動読み込み完了")
-    else:
-        api_key = st.text_input("Gemini API Key", type="password")
-        st.warning("⚠️ APIキーが未設定です")
-        
-    if "MS_REFRESH_TOKEN" in st.secrets:
-        st.success("✅ OneDrive 同期稼働中")
-    
-    if st.button("🔄 クラウドから最新データを強制再読込"):
+    if "GEMINI_API_KEY" in st.secrets: st.success("✅ AI連携稼働中")
+    if "MS_REFRESH_TOKEN" in st.secrets: st.success("✅ クラウド同期稼働中")
+    if st.button("🔄 クラウド再読込"):
         st.session_state.data_loaded = False
         st.rerun()
-        
-    selected_model = "gemini-3.1-flash-lite"
 
-# アプリ起動時に一度だけOneDriveから読み込む
 if "data_loaded" not in st.session_state or not st.session_state.data_loaded:
-    with st.spinner("☁️ OneDriveからデータを同期しています..."):
-        inv_df, shop_df = load_from_excel()
-        
-        if inv_df is not None:
-            st.session_state.inventory_df = inv_df
-            st.session_state.shopping_list_df = shop_df
-        else:
-            # 初回起動時（Excelがない場合）は初期データを作成してOneDriveに保存
-            st.session_state.inventory_df = pd.DataFrame([
-                {"食材名": "豚肉", "カテゴリ": "精肉", "残量": 200.0, "単位": "g", "購入日": datetime.date.today() - datetime.timedelta(days=4)},
-                {"食材名": "キャベツ", "カテゴリ": "青果", "残量": 1.0, "単位": "玉", "購入日": datetime.date.today()},
-                {"食材名": "玉ねぎ", "カテゴリ": "青果", "残量": 3.0, "単位": "個", "購入日": datetime.date.today() - datetime.timedelta(days=6)},
-                {"食材名": "卵", "カテゴリ": "日配品", "残量": 4.0, "単位": "個", "購入日": datetime.date.today() - datetime.timedelta(days=2)},
-                {"食材名": "牛乳", "カテゴリ": "日配品", "残量": 0.5, "単位": "本", "購入日": datetime.date.today() - datetime.timedelta(days=3)}
-            ])
-            st.session_state.shopping_list_df = pd.DataFrame(columns=["買出済", "食材名", "カテゴリ", "必要量", "単位", "確定献立のDAY", "確定献立のレシピ名"])
-            save_to_excel(st.session_state.inventory_df, st.session_state.shopping_list_df)
-            
+    with st.spinner("☁️ クラウドと同期中..."):
+        if not load_from_excel():
+            # 初回起動時: 全シートの初期データ作成
+            st.session_state.df_Inventory = pd.DataFrame([{"食材名": "豚肉", "カテゴリ": "精肉", "残量": 200.0, "単位": "g", "購入日": datetime.date.today()}])
+            st.session_state.df_ShoppingList = pd.DataFrame(columns=["買出済", "食材名", "カテゴリ", "必要量", "単位", "目的"])
+            st.session_state.df_Staples = pd.DataFrame([{"食材名": "牛乳", "カテゴリ": "日配品", "目標量": 2.0, "単位": "本"}])
+            st.session_state.df_Seasonings = pd.DataFrame([{"調味料名": "醤油", "在庫あり": True}, {"調味料名": "みりん", "在庫あり": True}])
+            st.session_state.df_PremadeSauces = pd.DataFrame([{"商品名": "麻婆豆腐の素", "対応メニュー": "麻婆豆腐"}])
+            st.session_state.df_TransactionLog = pd.DataFrame(columns=["日時", "食材名", "カテゴリ", "入出庫", "数量"])
+            st.session_state.df_Ratings = pd.DataFrame(columns=["日時", "レシピ名", "評価"])
+            save_to_excel()
         st.session_state.data_loaded = True
 
-if "draft_plan" not in st.session_state:
-    st.session_state.draft_plan = []
-if "final_plan" not in st.session_state:
-    st.session_state.final_plan = []
-if "selected_order" not in st.session_state:
-    st.session_state.selected_order = []
+# 履歴記録
+def log_transaction(item, category, io_type, amount):
+    new_log = pd.DataFrame([{"日時": datetime.datetime.now(), "食材名": item, "カテゴリ": category, "入出庫": io_type, "数量": amount}])
+    st.session_state.df_TransactionLog = pd.concat([st.session_state.df_TransactionLog, new_log], ignore_index=True)
 
-UNIT_OPTIONS = ["g", "個", "玉", "本", "束", "パック", "枚", "ml"]
-CATEGORY_OPTIONS = ["青果", "精肉", "鮮魚", "日配品", "加工食品", "その他"]
-STAPLE_ITEMS = [
-    {"食材名": "牛乳", "カテゴリ": "日配品", "目標量": 2.0, "単位": "本"},
-    {"食材名": "卵", "カテゴリ": "日配品", "目標量": 10.0, "単位": "個"},
-    {"食材名": "玉ねぎ", "カテゴリ": "青果", "目標量": 5.0, "単位": "個"}
-]
-
-# ==========================================
-# 3. ユーティリティ関数
-# ==========================================
-def generate_via_gemini(prompt, key, model_name, sys_prompt):
-    if not key or not model_name:
-        st.error("APIキーが設定されていません。")
-        return None
-    payload = {"contents": [{"parts": [{"text": sys_prompt + "\n\n" + prompt}]}]}
-    headers = {'Content-Type': 'application/json'}
-    for version in ["v1", "v1beta", "v1alpha"]:
-        url = f"https://generativelanguage.googleapis.com/{version}/models/{model_name}:generateContent?key={key}"
-        try:
-            res = requests.post(url, headers=headers, json=payload)
-            if res.status_code == 200:
-                text = res.json()["candidates"][0]["content"]["parts"][0]["text"]
-                return json.loads(text.replace("```json", "").replace("```", "").strip())
-        except Exception:
-            pass
-    return None
-
-def calculate_shopping_list(plan_list):
-    required = {}
-    for idx, r in enumerate(plan_list):
-        day_str = f"Day {idx+1}"
-        recipe_name = r.get("name", "")
-        for ing, amt in r.get("ingredients", {}).items():
-            if ing not in required:
-                required[ing] = {"amt": 0, "unit": r.get("unit_map", {}).get(ing, ""), "days": set(), "recipes": set()}
-            required[ing]["amt"] += float(amt)
-            required[ing]["days"].add(day_str)
-            required[ing]["recipes"].add(recipe_name)
-            
-    inv_total = st.session_state.inventory_df.groupby("食材名")["残量"].sum().to_dict()
-    shop_data = []
-    for ing, data in required.items():
-        inv_amt = float(inv_total.get(ing, 0))
-        shortage = data["amt"] - inv_amt
-        if shortage > 0:
-            shop_data.append({
-                "買出済": False, "食材名": ing, "カテゴリ": "その他", "必要量": shortage, "単位": data["unit"], 
-                "確定献立のDAY": ", ".join(sorted(data["days"])), "確定献立のレシピ名": ", ".join(data["recipes"])
-            })
+# 厳密な再計算ロジック
+def refresh_shopping_list():
+    req_dict = {}
     
-    if shop_data:
-        new_df = pd.DataFrame(shop_data)
-        st.session_state.shopping_list_df = pd.concat([st.session_state.shopping_list_df, new_df], ignore_index=True)
-    else:
-        # 新規追加がない場合は空のDataFrameを維持するなどの処理
-        pass
-        
-    save_to_excel(st.session_state.inventory_df, st.session_state.shopping_list_df) # 同期
+    # 1. 確定献立からの必要量
+    for r in st.session_state.get("final_plan", []):
+        for ing, amt in r.get("ingredients", {}).items():
+            unit = r.get("unit_map", {}).get(ing, "個")
+            if ing not in req_dict: req_dict[ing] = {"amt": 0.0, "unit": unit, "reason": "献立"}
+            req_dict[ing]["amt"] += float(amt)
+            
+    # 2. 定番品からの必要量
+    for _, row in st.session_state.df_Staples.iterrows():
+        ing, amt, unit = row["食材名"], float(row["目標量"]), row["単位"]
+        if ing not in req_dict: req_dict[ing] = {"amt": 0.0, "unit": unit, "reason": "定番補充"}
+        else: req_dict[ing]["amt"] = max(req_dict[ing]["amt"], amt) # 定番と献立で被った場合は多い方を採用
+
+    # 3. 在庫との引き算
+    inv_total = st.session_state.df_Inventory.groupby("食材名")["残量"].sum().to_dict()
+    new_shop_data = []
+    for ing, data in req_dict.items():
+        shortage = data["amt"] - float(inv_total.get(ing, 0.0))
+        if shortage > 0:
+            new_shop_data.append({"買出済": False, "食材名": ing, "カテゴリ": "青果", "必要量": shortage, "単位": data["unit"], "目的": data["reason"]})
+            
+    st.session_state.df_ShoppingList = pd.DataFrame(new_shop_data) if new_shop_data else pd.DataFrame(columns=["買出済", "食材名", "カテゴリ", "必要量", "単位", "目的"])
+    save_to_excel()
 
 def consume_fifo(ingredients_dict):
-    """FIFO（古い購入日から順に消費）で在庫を減算しクラウド同期"""
-    df = st.session_state.inventory_df
-    for ing, required_amt in ingredients_dict.items():
-        remaining_to_consume = float(required_amt)
+    df = st.session_state.df_Inventory
+    for ing, req_amt in ingredients_dict.items():
+        remaining = float(req_amt)
         target_indices = df[df["食材名"] == ing].sort_values("購入日").index.tolist()
         
+        # カテゴリ取得用
+        cat = df[df["食材名"] == ing]["カテゴリ"].iloc[0] if not df[df["食材名"] == ing].empty else "その他"
+        log_transaction(ing, cat, "消費", req_amt)
+        
         for idx in target_indices:
-            if remaining_to_consume <= 0: break
-            current_amt = float(df.at[idx, "残量"])
-            if current_amt <= remaining_to_consume:
-                remaining_to_consume -= current_amt
+            if remaining <= 0: break
+            current = float(df.at[idx, "残量"])
+            if current <= remaining:
+                remaining -= current
                 df.at[idx, "残量"] = 0.0
             else:
-                df.at[idx, "残量"] = current_amt - remaining_to_consume
-                remaining_to_consume = 0.0
-                
-    st.session_state.inventory_df = df[df["残量"] > 0].reset_index(drop=True)
-    save_to_excel(st.session_state.inventory_df, st.session_state.shopping_list_df) # 同期
-
-def toggle_recipe(idx):
-    if idx in st.session_state.selected_order:
-        st.session_state.selected_order.remove(idx)
-    else:
-        st.session_state.selected_order.append(idx)
+                df.at[idx, "残量"] = current - remaining
+                remaining = 0.0
+    st.session_state.df_Inventory = df[df["残量"] > 0].reset_index(drop=True)
+    refresh_shopping_list() # 在庫が減ったので買出しリストを再計算
 
 # ==========================================
-# UI: タブ構成 (5タブに拡張)
+# UI: 6つのタブ
 # ==========================================
-tab_create, tab_home, tab_shop, tab_consume, tab_inv = st.tabs(["⚙️ 献立作成", "📅 献立確定", "🛒 買出し", "🍳 個別消費", "📦 在庫管理"])
+if "draft_plan" not in st.session_state: st.session_state.draft_plan = []
+if "final_plan" not in st.session_state: st.session_state.final_plan = []
+if "selected_order" not in st.session_state: st.session_state.selected_order = []
+
+tab_create, tab_home, tab_shop, tab_consume, tab_manage, tab_dash = st.tabs(["⚙️ 作成", "📅 確定", "🛒 買出し", "🍳 消費", "📦 管理", "📊 分析"])
 
 # ------------------------------------------
-# Tab 1: 献立作成
+# Tab 1: 献立作成 (AIロジック最適化)
 # ------------------------------------------
 with tab_create:
     st.header("献立の作成")
     mode = st.radio("作成モード", ["在庫消費優先", "リクエスト優先"], horizontal=True)
     target_days = st.number_input("何日分作成しますか？", min_value=1, max_value=7, value=3)
     
+    req_prompt = ""
     if mode == "在庫消費優先":
-        st.caption("現在庫のうち、購入日が古い食材をAIが自動で優先的に使って献立を考えます。")
-        sorted_df = st.session_state.inventory_df.sort_values(by="購入日", ascending=True)
+        sorted_df = st.session_state.df_Inventory.sort_values(by="購入日", ascending=True)
         st.dataframe(sorted_df[["購入日", "食材名", "残量", "単位"]].head(5), use_container_width=True, hide_index=True)
-        
-        req_prompt = f"以下の在庫データは「購入日が古い順」に並んでいます。上位の古い食材を優先的に使い切るように、{target_days}日分のお米に合う夕食レシピを考案してください。\n"
-        req_prompt += f"【在庫データ（古い順）】\n{sorted_df.to_json(orient='records', force_ascii=False)}\n"
-            
+        req_prompt = f"在庫データ(古い順): {sorted_df.to_json(orient='records', force_ascii=False)}\n"
     else:
-        st.caption(f"※指定日数の2倍（{target_days * 2}品）のレシピを提案します。")
-        example_menus = ["彩り鮮やかな野菜の黒酢あん", "ホロホロ鶏肉のトマト煮込み", "ガツンとニンニク香る豚バラ炒め", "さっぱり柚子胡椒の和風パスタ", "鮭のふっくらホイル焼き"]
-        requests_list = []
-        for d in range(int(target_days)):
-            ex = example_menus[d % len(example_menus)]
-            req = st.text_input(f"Day {d+1} のリクエスト", placeholder=f"例：{ex}", key=f"req_day_{d}")
-            requests_list.append(req)
-            
-        req_prompt = f"以下のリクエストに基づき、合計 {target_days * 2}品 のお米に合う夕食レシピを考案してください。\n【リクエスト】\n{requests_list}\n"
+        reqs = [st.text_input(f"Day {d+1} のリクエスト", key=f"r_{d}") for d in range(int(target_days))]
+        req_prompt = f"リクエスト: {reqs}\n"
 
     if st.button("✨ レシピ案を生成", type="primary", use_container_width=True):
-        with st.spinner("AIが詳細なレシピを考案中..."):
-            sys_prompt = """
-            あなたはプロの料理研究家です。条件に基づき、以下のJSON配列のフォーマットを【厳密に】守って出力してください。
-            ・調味料は「炒め用」「下味」「合わせ調味料」など用途別に連想配列で分類してください。
-            ・手順やポイントは、必ず「見出し(title)」と「詳細説明(desc)」のセットにしてください。
+        with st.spinner("AIが考案中..."):
+            # AI成長システム用: 過去の高評価データ抽出
+            hi_rates = st.session_state.df_Ratings[st.session_state.df_Ratings["評価"] >= 4]["レシピ名"].tolist()
+            # レトルトデータ抽出
+            premades = st.session_state.df_PremadeSauces.to_json(orient='records', force_ascii=False)
             
-            [
-              {
-                "name": "豚こまとズッキーニ、舞茸のガリバタ醤油炒め",
-                "intro": "豚こま肉の旨味、ズッキーニのジューシーさ...ご飯のおかずにもぴったりの一品です。",
-                "ingredients": {"豚こま切れ肉": 200, "ズッキーニ": 1, "舞茸": 1},
-                "unit_map": {"豚こま切れ肉": "g", "ズッキーニ": "本", "舞茸": "パック"},
-                "seasonings": {
-                  "炒め用・その他": ["にんにく（みじん切り）", "バター", "サラダ油"],
-                  "豚肉の下味": ["酒", "塩こしょう", "片栗粉"],
-                  "合わせ調味料": ["醤油", "みりん"]
-                },
-                "steps": [
-                  {"title": "具材の下準備", "desc": "ズッキーニは縦半分に切り、幅1cmほどの半月切りにします。舞茸は石づきを取り..."},
-                  {"title": "豚肉の下処理", "desc": "豚こま切れ肉はボウルに入れ、下味の酒、塩こしょうを揉み込みます..."},
-                  {"title": "香りを出して豚肉を炒める", "desc": "フライパンにサラダ油とみじん切りにしたにんにくを入れて弱火にかけます..."}
-                ],
-                "tips": [
-                  {"title": "お肉に片栗粉をまぶす", "desc": "豚肉がパサつかず柔らかく仕上がるだけでなく、タレがしっかり絡むようになります。"},
-                  {"title": "ズッキーニの焼き加減", "desc": "ズッキーニは少し焼き色がつくくらいまでしっかり炒めると、中がトロッとジューシーに仕上がります。"}
-                ]
-              }
-            ]
+            sys_prompt = f"""
+            プロの料理研究家として以下のJSON配列を厳密に出力してください。
+            1. リクエストと消費食材に基づき、純粋に客観的で最適なメニューを考案。
+            2. 以下の高評価データから味の好みを推測して反映 (ただし過去メニューそのものの再提案は厳禁)。
+            【高評価推測用データ】: {hi_rates}
+            3. メニュー決定後、以下の「便利調味料リスト」を確認し、完全に合致するものがある場合のみ、調合せずそれを使う手順を出力。
+            【便利調味料リスト】: {premades}
+            
+            [出力フォーマット]
+            [{{"name": "料理名", "intro": "紹介", "ingredients": {{"豚肉": 200}}, "unit_map": {{"豚肉": "g"}}, "seasonings": {{"調味料": ["醤油", "酒"]}}, "steps": [{{"title": "下準備", "desc": "切る"}}], "tips": ["ポイント"]}}]
             """
-            prompt = f"条件: 2人前。\n" + req_prompt
-            res = generate_via_gemini(prompt, api_key, selected_model, sys_prompt)
+            res = generate_via_gemini(f"条件: {target_days * 2}品提案。2人前。\n" + req_prompt, sys_prompt)
             if res:
                 st.session_state.draft_plan = res
                 st.session_state.selected_order = []
 
     if st.session_state.draft_plan:
         st.divider()
-        st.markdown(f"**💡 採用するレシピを {target_days} つ選んでください**")
-        st.caption("チェックした順に DAY が割り当てられます。")
-        
+        st.markdown(f"**💡 採用するレシピを {target_days} つ選択**")
         for i, recipe in enumerate(st.session_state.draft_plan):
             is_selected = (i in st.session_state.selected_order)
-            order_badge = f"<span class='day-badge'>DAY {st.session_state.selected_order.index(i) + 1}</span>" if is_selected else ""
-                
+            badge = f"<span class='day-badge'>DAY {st.session_state.selected_order.index(i) + 1}</span>" if is_selected else ""
             cols = st.columns([1, 8])
             with cols[0]:
-                st.checkbox(" ", value=is_selected, on_change=toggle_recipe, args=(i,), key=f"sel_{i}")
-            with cols[1]:
-                st.markdown(f"{order_badge} **{recipe['name']}**", unsafe_allow_html=True)
+                if st.checkbox(" ", value=is_selected, key=f"sel_{i}"):
+                    if i not in st.session_state.selected_order: st.session_state.selected_order.append(i)
+                else:
+                    if i in st.session_state.selected_order: st.session_state.selected_order.remove(i)
+            with cols[1]: st.markdown(f"{badge} **{recipe['name']}**", unsafe_allow_html=True)
                 
-        if len(st.session_state.selected_order) > 0:
-            st.write("")
-            if st.button("✅ チェックしたレシピで確定", type="primary", use_container_width=True):
-                st.session_state.final_plan = [st.session_state.draft_plan[idx] for idx in st.session_state.selected_order]
-                calculate_shopping_list(st.session_state.final_plan)
-                st.session_state.draft_plan = []
-                st.session_state.selected_order = []
-                st.success("確定しました！「献立確定」タブへ移動してください。")
-                st.rerun()
+        if len(st.session_state.selected_order) > 0 and st.button("✅ 確定する", type="primary", use_container_width=True):
+            st.session_state.final_plan = [st.session_state.draft_plan[idx] for idx in st.session_state.selected_order]
+            refresh_shopping_list() # 確定時に自動計算
+            st.session_state.draft_plan = []
+            st.session_state.selected_order = []
+            st.success("確定しました！「📅 確定」タブへ移動してください。")
+            st.rerun()
 
 # ------------------------------------------
-# Tab 2: 献立確定
+# Tab 2: 献立確定 & 評価システム
 # ------------------------------------------
 with tab_home:
     st.header("📅 確定した献立")
     if not st.session_state.final_plan:
-        st.info("「献立作成」タブからメニューを確定させてください。")
+        st.info("「⚙️ 作成」タブからメニューを確定させてください。")
     else:
-        inv_total = st.session_state.inventory_df.groupby("食材名")["残量"].sum().to_dict()
+        inv_total = st.session_state.df_Inventory.groupby("食材名")["残量"].sum().to_dict()
+        stocked_seasonings = st.session_state.df_Seasonings[st.session_state.df_Seasonings["在庫あり"] == True]["調味料名"].tolist()
         
         for i, r in enumerate(st.session_state.final_plan):
             with st.expander(f"Day {i+1}: {r['name']}", expanded=(i==0)):
                 st.markdown(f"*{r.get('intro', '')}*")
-                
                 col_left, col_right = st.columns(2)
+                
                 with col_left:
                     st.markdown("#### 🔪 材料（2人分）")
                     for ing, amt in r.get("ingredients", {}).items():
                         unit = r.get("unit_map", {}).get(ing, "")
-                        inv_amt = float(inv_total.get(ing, 0))
-                        if inv_amt < float(amt):
-                            st.error(f"- **{ing}**: {amt} {unit} ⚠️不足 (在庫: {inv_amt}{unit})")
-                        else:
-                            st.write(f"- **{ing}**: {amt} {unit}")
-                
+                        if float(inv_total.get(ing, 0)) < float(amt): st.error(f"- {ing}: {amt} {unit} ⚠️不足")
+                        else: st.write(f"- {ing}: {amt} {unit}")
+                        
                 with col_right:
-                    st.markdown("#### 🧂 調味料・基本食材")
-                    st.caption("※分量管理なし。有無のチェック用")
-                    seasonings = r.get("seasonings", {})
-                    if isinstance(seasonings, dict):
-                        for cat_name, items in seasonings.items():
-                            st.markdown(f"**【{cat_name}】**")
-                            for s in items:
-                                st.checkbox(s, key=f"seasoning_{i}_{cat_name}_{s}")
-                    elif isinstance(seasonings, list):
-                        for s in seasonings:
-                            st.checkbox(s, key=f"seasoning_{i}_{s}")
+                    st.markdown("#### 🧂 調味料・ストック確認")
+                    for cat, items in r.get("seasonings", {}).items():
+                        st.markdown(f"**【{cat}】**")
+                        for s in items:
+                            # 調味料リストと照合。リストに無いものは赤字でアラート
+                            is_stocked = any(stocked_s in s for stocked_s in stocked_seasonings)
+                            if is_stocked: st.write(f"✔️ {s}")
+                            else: st.error(f"❌ {s} (在庫リスト未登録)")
                         
                 st.markdown("#### 🍳 作り方")
-                for step_idx, step in enumerate(r.get("steps", [])): 
-                    if isinstance(step, dict):
-                        st.markdown(f"**{step_idx+1}. {step.get('title', '')}**")
-                        st.write(f"{step.get('desc', '')}")
-                    else:
-                        st.write(f"- {step}")
-                    
-                if r.get("tips"):
-                    st.markdown("#### 💡 美味しく作るためのポイント")
-                    for tip in r.get("tips", []): 
-                        if isinstance(tip, dict):
-                            st.markdown(f"- **{tip.get('title', '')}**: {tip.get('desc', '')}")
-                        else:
-                            st.info(tip)
+                for step in r.get("steps", []): st.write(f"**{step.get('title', '')}**: {step.get('desc', '')}")
                 
-                st.write("")
-                if st.button(f"👩‍🍳 Day {i+1} 調理完了 (在庫から減算)", key=f"consume_btn_{i}", type="secondary", use_container_width=True):
-                    consume_fifo(r.get("ingredients", {}))
-                    st.success("古い在庫から順に材料を差し引き、クラウドに同期しました！")
-                    st.rerun()
+                st.divider()
+                st.markdown("**🍽️ 食後の評価・記録**")
+                cols_r = st.columns([1, 2])
+                with cols_r[0]: rating = st.selectbox("星評価", [5,4,3,2,1], format_func=lambda x: "⭐"*x, key=f"rate_{i}")
+                with cols_r[1]:
+                    if st.button("👩‍🍳 調理完了 (消費記録と評価を保存)", key=f"btn_{i}", type="primary", use_container_width=True):
+                        consume_fifo(r.get("ingredients", {}))
+                        # 評価を保存
+                        new_rating = pd.DataFrame([{"日時": datetime.datetime.now(), "レシピ名": r['name'], "評価": rating}])
+                        st.session_state.df_Ratings = pd.concat([st.session_state.df_Ratings, new_rating], ignore_index=True)
+                        save_to_excel()
+                        st.success("クラウド在庫の更新とAIへの評価送信が完了しました！")
+                        st.rerun()
 
 # ------------------------------------------
-# Tab 3: 買出しリスト
+# Tab 3: 買出しリスト (厳密再計算連動)
 # ------------------------------------------
 with tab_shop:
     st.header("🛒 買出しリスト")
+    st.caption("※在庫管理表の量と必要量を比較し、不足分のみを自動で計算して表示しています。")
     
-    if st.button("🔄 定番アイテムの不足分を追加", use_container_width=True):
-        inv_total = st.session_state.inventory_df.groupby("食材名")["残量"].sum().to_dict()
-        added = 0
-        for item in STAPLE_ITEMS:
-            current = float(inv_total.get(item["食材名"], 0))
-            if item["目標量"] - current > 0:
-                if st.session_state.shopping_list_df[st.session_state.shopping_list_df["食材名"] == item["食材名"]].empty:
-                    new_row = pd.DataFrame([{"買出済": False, "食材名": item["食材名"], "カテゴリ": item["カテゴリ"], "必要量": item["目標量"] - current, "単位": item["単位"], "確定献立のDAY": "ストック", "確定献立のレシピ名": "定番補充"}])
-                    st.session_state.shopping_list_df = pd.concat([st.session_state.shopping_list_df, new_row], ignore_index=True)
-                    added += 1
-        st.success(f"{added}件の定番アイテムを追加しました。" if added > 0 else "ストックは十分です。")
-        if added > 0:
-            save_to_excel(st.session_state.inventory_df, st.session_state.shopping_list_df)
-
-    if len(st.session_state.shopping_list_df) == 0:
-        st.info("買い出しが必要な食材はありません。")
+    if len(st.session_state.df_ShoppingList) == 0:
+        st.info("買い出しが必要な食材はありません。すべて充足しています！")
     else:
-        edited_shop = st.data_editor(
-            st.session_state.shopping_list_df,
-            num_rows="dynamic",
-            column_config={
-                "買出済": st.column_config.CheckboxColumn("買出済", default=False),
-                "カテゴリ": st.column_config.SelectboxColumn("カテゴリ", options=CATEGORY_OPTIONS),
-                "確定献立のDAY": st.column_config.TextColumn("使用日", disabled=True),
-                "確定献立のレシピ名": st.column_config.TextColumn("対象レシピ", disabled=True)
-            },
-            key="editor_shop",
-            use_container_width=True
-        )
+        edited_shop = st.data_editor(st.session_state.df_ShoppingList, num_rows="dynamic", use_container_width=True, key="ed_shop",
+            column_config={"買出済": st.column_config.CheckboxColumn("買出済", default=False), "目的": st.column_config.TextColumn(disabled=True)})
         
-        # もしリストの内容（カテゴリ修正や行追加など）が変更されたら保存
-        if not edited_shop.equals(st.session_state.shopping_list_df):
-            st.session_state.shopping_list_df = edited_shop
-            save_to_excel(st.session_state.inventory_df, st.session_state.shopping_list_df)
-
         if st.button("✅ チェック済みの品を在庫へ反映", type="primary", use_container_width=True):
             purchased = edited_shop[edited_shop["買出済"] == True]
-            pending = edited_shop[edited_shop["買出済"] == False]
+            inv_df = st.session_state.df_Inventory
             today = datetime.date.today()
             
-            if not purchased.empty:
-                inv_df = st.session_state.inventory_df
-                for _, row in purchased.iterrows():
-                    ing_name = row["食材名"]
-                    match_idx = inv_df[(inv_df["食材名"] == ing_name) & (inv_df["購入日"] == today)].index
-                    if not match_idx.empty:
-                        inv_df.at[match_idx[0], "残量"] += float(row["必要量"])
-                    else:
-                        new_row = pd.DataFrame([{"食材名": ing_name, "カテゴリ": row.get("カテゴリ", "その他"), "残量": float(row["必要量"]), "単位": row["単位"], "購入日": today}])
-                        inv_df = pd.concat([inv_df, new_row], ignore_index=True)
-                st.session_state.inventory_df = inv_df
-                st.session_state.shopping_list_df = pending
-                save_to_excel(st.session_state.inventory_df, st.session_state.shopping_list_df)
-                st.success("在庫に追加し、クラウドに保存しました！")
-                st.rerun()
-
-    st.divider()
-    
-    st.subheader("🛍 音声スピード登録")
-    voice_input = st.text_area("購入品を入力（マイク入力推奨）", placeholder="例：特売の豚肉500g")
-    
-    if st.button("🪄 解析して在庫に追加", use_container_width=True):
-        with st.spinner("解析中..."):
-            sys_prompt = """入力から食材名、数量、単位を抽出し、以下のJSON配列で出力してください。カテゴリは "青果", "精肉", "鮮魚", "日配品", "加工食品", "その他" から推測。[{"name": "食材名", "amount": 数量(数値), "unit": "単位", "category": "カテゴリ"}]"""
-            parsed_items = generate_via_gemini(voice_input, api_key, selected_model, sys_prompt)
-            if parsed_items:
-                inv_df = st.session_state.inventory_df
-                today = datetime.date.today()
-                added_str = []
-                for item in parsed_items:
-                    ing_name = item.get("name")
-                    match_idx = inv_df[(inv_df["食材名"] == ing_name) & (inv_df["購入日"] == today)].index
-                    if not match_idx.empty:
-                        inv_df.at[match_idx[0], "残量"] += float(item.get("amount", 1))
-                    else:
-                        new_row = pd.DataFrame([{"食材名": ing_name, "カテゴリ": item.get("category", "その他"), "残量": float(item.get("amount", 1)), "単位": item.get("unit", "個"), "購入日": today}])
-                        inv_df = pd.concat([inv_df, new_row], ignore_index=True)
-                    added_str.append(f"{ing_name}({item.get('amount')}{item.get('unit')})")
-                st.session_state.inventory_df = inv_df
-                save_to_excel(st.session_state.inventory_df, st.session_state.shopping_list_df)
-                st.success(f"追加完了（クラウド保存済）: {', '.join(added_str)}")
-
-# ------------------------------------------
-# Tab 4: 個別消費 (専用画面)
-# ------------------------------------------
-with tab_consume:
-    st.header("🍳 個別消費")
-    st.caption("夕食の献立以外（朝食やお弁当など）で使った食材をここで記録します。購入日が古いものから自動で減算（FIFO）されます。")
-    
-    with st.container(border=True):
-        unique_items = sorted(st.session_state.inventory_df["食材名"].unique().tolist())
-        
-        cols_c = st.columns([1, 1])
-        with cols_c[0]:
-            consume_target = st.selectbox("🍎 どの食材を使いましたか？", unique_items if unique_items else ["(在庫なし)"])
-        with cols_c[1]:
-            consume_amt = st.number_input("⚖️ 使った量", min_value=0.1, value=1.0, step=0.5)
-            
-        st.write("") 
-        if st.button("一括で消費を記録する", type="primary", use_container_width=True) and unique_items:
-            consume_fifo({consume_target: consume_amt})
-            st.success(f"✅ {consume_target} を {consume_amt} 消費し、クラウドに保存しました。")
+            for _, row in purchased.iterrows():
+                # 購入ログを記録
+                log_transaction(row["食材名"], row.get("カテゴリ", "その他"), "購入", row["必要量"])
+                match_idx = inv_df[(inv_df["食材名"] == row["食材名"]) & (inv_df["購入日"] == today)].index
+                if not match_idx.empty: inv_df.at[match_idx[0], "残量"] += float(row["必要量"])
+                else:
+                    new_row = pd.DataFrame([{"食材名": row["食材名"], "カテゴリ": row.get("カテゴリ", "その他"), "残量": float(row["必要量"]), "単位": row["単位"], "購入日": today}])
+                    inv_df = pd.concat([inv_df, new_row], ignore_index=True)
+                    
+            st.session_state.df_Inventory = inv_df
+            refresh_shopping_list() # 在庫が増えたので買出しリストを再計算（完了したものは自動で消える）
+            st.success("在庫に追加し、リストを再計算しました！")
             st.rerun()
 
 # ------------------------------------------
-# Tab 5: 食材管理
+# Tab 4: 個別消費 
 # ------------------------------------------
-with tab_inv:
-    st.header("📦 在庫管理表")
-    st.caption("直接編集・削除が可能です。※同じ食材でも購入日が異なれば別行として管理されます。")
+with tab_consume:
+    st.header("🍳 個別消費")
+    unique_items = sorted(st.session_state.df_Inventory["食材名"].unique().tolist())
+    cols_c = st.columns([1, 1])
+    with cols_c[0]: target = st.selectbox("🍎 どの食材を使いましたか？", unique_items if unique_items else ["(なし)"])
+    with cols_c[1]: amt = st.number_input("⚖️ 使った量", min_value=0.1, value=1.0, step=0.5)
+        
+    if st.button("一括で消費を記録する", type="primary", use_container_width=True) and unique_items:
+        consume_fifo({target: amt})
+        st.success(f"✅ {target} を {amt} 消費しました。")
+        st.rerun()
+
+# ------------------------------------------
+# Tab 5: マスターデータ管理 (サブタブ構成)
+# ------------------------------------------
+with tab_manage:
+    sub_inv, sub_staple, sub_seasoning, sub_premade = st.tabs(["📦 在庫表", "🥛 定番品", "🧂 調味料", "🍛 便利レトルト"])
     
-    old_names = st.session_state.inventory_df["食材名"].tolist()
+    with sub_inv:
+        st.caption("直接編集すると、買い出しリストも連動して再計算されます。")
+        edited_inv = st.data_editor(st.session_state.df_Inventory, num_rows="dynamic", use_container_width=True, key="ed_inv")
+        if not edited_inv.equals(st.session_state.df_Inventory):
+            st.session_state.df_Inventory = edited_inv
+            refresh_shopping_list() # 在庫が直接書き換えられたら即座に再計算
+
+    with sub_staple:
+        st.caption("常にストックしておきたい量（目標量）を設定します。")
+        edited_staple = st.data_editor(st.session_state.df_Staples, num_rows="dynamic", use_container_width=True, key="ed_sta")
+        if not edited_staple.equals(st.session_state.df_Staples):
+            st.session_state.df_Staples = edited_staple
+            refresh_shopping_list() # 定番が変わったら即座に再計算
+
+    with sub_seasoning:
+        st.caption("家にある調味料にチェックを入れます。献立確定時に無いものだけアラートが出ます。")
+        edited_season = st.data_editor(st.session_state.df_Seasonings, num_rows="dynamic", use_container_width=True, key="ed_sea")
+        if not edited_season.equals(st.session_state.df_Seasonings):
+            st.session_state.df_Seasonings = edited_season
+            save_to_excel()
+            
+    with sub_premade:
+        st.caption("家にある「〇〇の素」やパスタソースを登録。AIが献立に合うと判断した時だけ提案します。")
+        edited_premade = st.data_editor(st.session_state.df_PremadeSauces, num_rows="dynamic", use_container_width=True, key="ed_pre")
+        if not edited_premade.equals(st.session_state.df_PremadeSauces):
+            st.session_state.df_PremadeSauces = edited_premade
+            save_to_excel()
+
+# ------------------------------------------
+# Tab 6: 分析ダッシュボード (ドリルダウン)
+# ------------------------------------------
+with tab_dash:
+    st.header("📊 入出庫・消費トレンド")
+    log_df = st.session_state.df_TransactionLog
     
-    edited_inv_main = st.data_editor(
-        st.session_state.inventory_df,
-        num_rows="dynamic",
-        column_config={
-            "カテゴリ": st.column_config.SelectboxColumn("カテゴリ", options=CATEGORY_OPTIONS, required=True),
-            "単位": st.column_config.SelectboxColumn("単位", options=UNIT_OPTIONS, required=True),
-            "購入日": st.column_config.DateColumn("購入日", format="YYYY/MM/DD")
-        },
-        key="editor_inv",
-        use_container_width=True
-    )
-    
-    new_names = edited_inv_main["食材名"].dropna().tolist()
-    if len(new_names) > len(old_names):
-        added_item = list(set(new_names) - set(old_names))
-        if added_item:
-            matches = difflib.get_close_matches(added_item[0], old_names, n=1, cutoff=0.6)
-            if matches:
-                st.warning(f"⚠️ 表記ゆれアラート: 追加された「{added_item[0]}」は、登録済みの「{matches[0]}」と統合できる可能性があります。")
-                
-    # ユーザーが表を直接編集した場合、クラウドに上書き保存
-    if not edited_inv_main.equals(st.session_state.inventory_df):
-        st.session_state.inventory_df = edited_inv_main
-        save_to_excel(st.session_state.inventory_df, st.session_state.shopping_list_df)
-        st.success("☁️ クラウドに変更を保存しました！")
+    if log_df.empty:
+        st.info("まだデータの蓄積がありません。買出しや消費を記録するとグラフが表示されます。")
+    else:
+        log_df["月日"] = log_df["日時"].dt.strftime('%m/%d')
+        
+        # 1. ドリルダウンUI
+        cols_d = st.columns([1, 1])
+        categories = ["すべて"] + list(log_df["カテゴリ"].unique())
+        with cols_d[0]: sel_cat = st.selectbox("カテゴリを絞り込む", categories)
+        
+        filtered_df = log_df if sel_cat == "すべて" else log_df[log_df["カテゴリ"] == sel_cat]
+        items = ["すべて"] + list(filtered_df["食材名"].unique())
+        with cols_d[1]: sel_item = st.selectbox("食材を指定する", items)
+        
+        final_df = filtered_df if sel_item == "すべて" else filtered_df[filtered_df["食材名"] == sel_item]
+        
+        st.write("")
+        st.subheader("📈 日別 購入 vs 消費量")
+        # グラフ用にデータをピボット変形
+        chart_data = final_df.groupby(["月日", "入出庫"])["数量"].sum().unstack(fill_value=0)
+        if "購入" not in chart_data: chart_data["購入"] = 0
+        if "消費" not in chart_data: chart_data["消費"] = 0
+        
+        st.bar_chart(chart_data[["購入", "消費"]], color=["#2e7bcf", "#E03C31"])
+        
+        st.divider()
+        st.subheader("🏆 AI 評価履歴")
+        st.dataframe(st.session_state.df_Ratings.sort_values(by="日時", ascending=False).head(10), use_container_width=True, hide_index=True)

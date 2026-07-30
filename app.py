@@ -36,7 +36,7 @@ def generate_via_gemini(prompt, sys_prompt=""):
     key = st.secrets.get("GEMINI_API_KEY")
     if not key: return None
     payload = {"contents": [{"parts": [{"text": sys_prompt + "\n\n" + prompt}]}]}
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={key}"
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-lite:generateContent?key={key}"
     try:
         res = requests.post(url, headers={'Content-Type': 'application/json'}, json=payload)
         if res.status_code == 200:
@@ -115,16 +115,30 @@ with st.sidebar:
 
 if "data_loaded" not in st.session_state or not st.session_state.data_loaded:
     with st.spinner("☁️ クラウドと同期中..."):
-        if not load_from_excel():
-            # 初回起動時: 全シートの初期データ作成
-            st.session_state.df_Inventory = pd.DataFrame([{"食材名": "豚肉", "カテゴリ": "精肉", "残量": 200.0, "単位": "g", "購入日": datetime.date.today()}])
-            st.session_state.df_ShoppingList = pd.DataFrame(columns=["買出済", "食材名", "カテゴリ", "必要量", "単位", "目的"])
-            st.session_state.df_Staples = pd.DataFrame([{"食材名": "牛乳", "カテゴリ": "日配品", "目標量": 2.0, "単位": "本"}])
-            st.session_state.df_Seasonings = pd.DataFrame([{"調味料名": "醤油", "在庫あり": True}, {"調味料名": "みりん", "在庫あり": True}])
-            st.session_state.df_PremadeSauces = pd.DataFrame([{"商品名": "麻婆豆腐の素", "対応メニュー": "麻婆豆腐"}])
-            st.session_state.df_TransactionLog = pd.DataFrame(columns=["日時", "食材名", "カテゴリ", "入出庫", "数量"])
-            st.session_state.df_Ratings = pd.DataFrame(columns=["日時", "レシピ名", "評価"])
+        load_from_excel() # まず既存のExcelから読めるシートだけ読む
+        
+        # 旧バージョンのExcelに存在しない新シート用の初期データを定義
+        defaults = {
+            "df_Inventory": pd.DataFrame([{"食材名": "豚肉", "カテゴリ": "精肉", "残量": 200.0, "単位": "g", "購入日": datetime.date.today()}]),
+            "df_ShoppingList": pd.DataFrame(columns=["買出済", "食材名", "カテゴリ", "必要量", "単位", "目的"]),
+            "df_Staples": pd.DataFrame([{"食材名": "牛乳", "カテゴリ": "日配品", "目標量": 2.0, "単位": "本"}]),
+            "df_Seasonings": pd.DataFrame([{"調味料名": "醤油", "在庫あり": True}, {"調味料名": "みりん", "在庫あり": True}]),
+            "df_PremadeSauces": pd.DataFrame([{"商品名": "麻婆豆腐の素", "対応メニュー": "麻婆豆腐"}]),
+            "df_TransactionLog": pd.DataFrame(columns=["日時", "食材名", "カテゴリ", "入出庫", "数量"]),
+            "df_Ratings": pd.DataFrame(columns=["日時", "レシピ名", "評価"])
+        }
+        
+        # 足りないシートのデータをセッションステートに補完
+        needs_save = False
+        for key, default_df in defaults.items():
+            if key not in st.session_state:
+                st.session_state[key] = default_df
+                needs_save = True
+                
+        # 1つでも足りないシートを追加した場合は、クラウドのExcelを上書きして再構築
+        if needs_save:
             save_to_excel()
+            
         st.session_state.data_loaded = True
 
 # 履歴記録

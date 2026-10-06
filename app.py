@@ -23,22 +23,17 @@ CATEGORY_ORDER = {"青果": 1, "精肉": 2, "鮮魚": 3, "日配品": 4, "加工
 SHEETS = ["Inventory", "ShoppingList", "Staples", "Seasonings", "PremadeSauces", "TransactionLog", "Ratings", "MealPlan", "Settings"]
 
 # ==========================================
-# 1. AI連携 & ユーティリティ
+# 1. AI連携 & データ補正ユーティリティ
 # ==========================================
 def extract_json(text):
     text = text.replace("```json", "").replace("```", "").strip()
     idx_list = text.find('[')
     idx_dict = text.find('{')
-    
     if idx_list != -1 and (idx_dict == -1 or idx_list < idx_dict):
-        start = idx_list
-        end = text.rfind(']') + 1
+        start, end = idx_list, text.rfind(']') + 1
     elif idx_dict != -1:
-        start = idx_dict
-        end = text.rfind('}') + 1
-    else:
-        return None
-        
+        start, end = idx_dict, text.rfind('}') + 1
+    else: return None
     try: return json.loads(text[start:end])
     except: return None
 
@@ -50,7 +45,6 @@ def generate_via_gemini(prompt, sys_prompt="", response_type="json", image_b64=N
         
     payload = {"contents": [{"parts": parts}], "generationConfig": {"temperature": 0.5}}
     url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-lite:generateContent?key={key}"
-    
     try:
         res = requests.post(url, headers={'Content-Type': 'application/json'}, json=payload, timeout=60)
         if res.status_code == 200:
@@ -58,6 +52,42 @@ def generate_via_gemini(prompt, sys_prompt="", response_type="json", image_b64=N
             return extract_json(text) if response_type == "json" else text
     except Exception: pass
     return None
+
+def find_closest_item(target_name, item_list, cutoff=0.75):
+    if target_name in item_list: return target_name
+    matches = difflib.get_close_matches(str(target_name), [str(x) for x in item_list], n=1, cutoff=cutoff)
+    return matches[0] if matches else None
+
+# ★ 新規追加：AIのミスを強制補正する絶対フィルター
+def sanitize_recipe(recipe):
+    user_s = st.session_state.df_Seasonings["調味料名"].tolist() if "df_Seasonings" in st.session_state else []
+    common_s = ["塩", "こしょう", "コショウ", "胡椒", "醤油", "しょうゆ", "砂糖", "みそ", "味噌", "酢", "みりん", "酒", "料理酒", "油", "サラダ油", "ごま油", "オリーブオイル", "マヨネーズ", "ケチャップ", "ソース", "ウスターソース", "中濃ソース", "だし", "だしの素", "コンソメ", "鶏ガラスープの素", "片栗粉", "小麦粉", "バター", "チューブにんにく", "チューブしょうが", "にんにく", "しょうが", "ポン酢", "めんつゆ", "白だし", "オイスターソース", "豆板醤", "甜面醤", "ごま", "ゴマ", "いりごま", "青のり", "かつおぶし", "マジックソルト"]
+    s_master = list(set(common_s + user_s))
+    
+    cleaned_ing, cleaned_unit, extracted_s = {}, {}, []
+    
+    for ing, amt in recipe.get("ingredients", {}).items():
+        if find_closest_item(ing, s_master, cutoff=0.7):
+            extracted_s.append(ing) # 調味料と判定し材料から没収
+        else:
+            cleaned_ing[ing] = amt
+            cleaned_unit[ing] = recipe.get("unit_map", {}).get(ing, "個")
+    
+    recipe["ingredients"] = cleaned_ing
+    recipe["unit_map"] = cleaned_unit
+    
+    raw_s = recipe.get("seasonings", [])
+    if isinstance(raw_s, dict):
+        flat_s = []
+        for v in raw_s.values():
+            if isinstance(v, list): flat_s.extend(v)
+            elif isinstance(v, str): flat_s.append(v)
+        raw_s = flat_s
+    elif not isinstance(raw_s, list):
+        raw_s = [str(raw_s)]
+        
+    recipe["seasonings"] = list(set(raw_s + extracted_s))
+    return recipe
 
 def batch_generate_recipes(req_prompt, sys_prompt_template, total_needed):
     all_recipes = []
@@ -67,14 +97,16 @@ def batch_generate_recipes(req_prompt, sys_prompt_template, total_needed):
         sys_prompt = sys_prompt_template.replace("{NUM}", str(batch_size))
         res = generate_via_gemini(req_prompt, sys_prompt, "json")
         if res and isinstance(res, list):
-            all_recipes.extend(res)
+            # ★ 生成直後に必ず検閲して補正
+            sanitized = [sanitize_recipe(r) for r in res]
+            all_recipes.extend(sanitized)
             remaining -= len(res)
-        else:
-            break
+        else: break
     return all_recipes
 
 def guess_category(item_name):
-    if any(x in item_name for x in ["肉", "豚", "牛", "鶏", "ウインナー"]): return "精肉"
+    if any(x in item_name for x in ["醤油", "塩", "味噌", "油", "ソース", "酢", "みりん", "酒", "砂糖", "マヨ"]): return "調味料"
+    if any(x in item_name for x in ["肉", "豚", "牛", "鶏", "ウインナー", "ベーコン"]): return "精肉"
     if any(x in item_name for x in ["魚", "鮭", "鯖", "えび", "イカ", "タコ"]): return "鮮魚"
     if any(x in item_name for x in ["野菜", "玉ねぎ", "人参", "キャベツ", "トマト", "ネギ", "ピーマン", "大根", "きのこ"]): return "青果"
     if any(x in item_name for x in ["牛乳", "卵", "チーズ", "ヨーグルト", "豆腐", "納豆"]): return "日配品"
@@ -133,11 +165,6 @@ def load_from_excel():
 # ==========================================
 # 3. データ処理ロジック
 # ==========================================
-def find_closest_item(target_name, item_list, cutoff=0.85):
-    if target_name in item_list: return target_name
-    matches = difflib.get_close_matches(str(target_name), [str(x) for x in item_list], n=1, cutoff=cutoff)
-    return matches[0] if matches else None
-
 def log_transaction(item, category, io_type, amount):
     new_log = pd.DataFrame([{"日時": datetime.datetime.now(), "食材名": item, "カテゴリ": category, "入出庫": io_type, "数量": amount}])
     st.session_state.df_TransactionLog = pd.concat([st.session_state.df_TransactionLog, new_log], ignore_index=True)
@@ -159,29 +186,38 @@ def sync_shopping_list_with_plan():
     inv_total = st.session_state.df_Inventory.groupby("食材名")["残量"].sum().to_dict()
     inv_items_list = list(inv_total.keys())
     premade_list = st.session_state.df_PremadeSauces["商品名"].tolist()
-    seasonings_list = st.session_state.df_Seasonings["調味料名"].tolist() # ★ 調味料マスターを取得
+    
+    all_s_df = st.session_state.df_Seasonings
+    avail_s = all_s_df[all_s_df["在庫あり"] == True]["調味料名"].tolist()
+    all_s = all_s_df["調味料名"].tolist()
     
     needed_items = {}
 
+    # 1. 材料の不足計算
     reserved = get_reserved_stock()
     for ing, reserved_amt in reserved.items():
         if find_closest_item(ing, premade_list): continue
-        if find_closest_item(ing, seasonings_list): continue # ★ 調味料は買出し計算から完全に除外
-        
         actual_ing = find_closest_item(ing, inv_items_list) or ing
         shortage = reserved_amt - float(inv_total.get(actual_ing, 0.0))
         if shortage > 0: needed_items[actual_ing] = {"amount": shortage, "unit": "個", "cat": "青果"}
 
+    # 2. 調味料の不足計算 (★新ロジック)
+    for plan in st.session_state.final_plan:
+        for s in plan.get("seasonings", []):
+            if not find_closest_item(s, avail_s, 0.7):
+                actual_s = find_closest_item(s, all_s, 0.7) or s
+                if actual_s not in needed_items:
+                    needed_items[actual_s] = {"amount": 1, "unit": "個", "cat": "調味料"}
+
+    # 3. 定番品の不足計算
     for _, row in st.session_state.df_Staples.iterrows():
         ing, target_amt, unit = row["食材名"], float(row["目標量"]), row["単位"]
         actual_ing = find_closest_item(ing, inv_items_list) or ing
         usable_stock = float(inv_total.get(actual_ing, 0.0)) - reserved.get(actual_ing, 0.0)
         shortage = target_amt - usable_stock
         if shortage > 0:
-            if actual_ing in needed_items:
-                needed_items[actual_ing]["amount"] += shortage
-            else:
-                needed_items[actual_ing] = {"amount": shortage, "unit": unit, "cat": row.get("カテゴリ", "日配品")}
+            if actual_ing in needed_items: needed_items[actual_ing]["amount"] += shortage
+            else: needed_items[actual_ing] = {"amount": shortage, "unit": unit, "cat": row.get("カテゴリ", "日配品")}
 
     new_rows = []
     for ing, data in needed_items.items():
@@ -189,10 +225,8 @@ def sync_shopping_list_with_plan():
         if cat == "青果": cat = guess_category(ing)
         
         final_amt = data["amount"]
-        if data["unit"] in ["本", "個", "玉", "袋", "パック"]:
-            final_amt = math.ceil(final_amt)
-        else:
-            final_amt = round(final_amt, 1)
+        if data["unit"] in ["本", "個", "玉", "袋", "パック"]: final_amt = math.ceil(final_amt)
+        else: final_amt = round(final_amt, 1)
             
         new_rows.append({"買出済": False, "食材名": ing, "カテゴリ": cat, "必要量": final_amt, "単位": data["unit"], "目的": "自動計算"})
         
@@ -207,11 +241,7 @@ def sync_shopping_list_with_plan():
 def consume_fifo(ingredients_dict):
     df = st.session_state.df_Inventory
     inv_items = df["食材名"].unique().tolist()
-    seasonings_list = st.session_state.df_Seasonings["調味料名"].tolist() # ★ 調味料マスターを取得
-    
     for req_ing, req_amt in ingredients_dict.items():
-        if find_closest_item(req_ing, seasonings_list): continue # ★ 調味料は在庫消費計算から完全に除外
-        
         actual_ing = find_closest_item(req_ing, inv_items)
         if not actual_ing: continue 
         remaining = float(req_amt)
@@ -249,11 +279,10 @@ with st.sidebar:
     blacklist = st.text_area("🚫 絶対に避ける食材\n(アレルギー・嫌いなもの)", value=settings_dict.get("blacklist", ""))
     if st.button("設定を保存"):
         st.session_state.df_Settings = pd.DataFrame([{"Key": "blacklist", "Value": blacklist}])
-        save_to_excel()
-        st.success("保存しました")
+        save_to_excel(); st.success("保存しました")
 
 if "data_loaded" not in st.session_state or not st.session_state.data_loaded:
-    with st.spinner("☁️️ クラウド同期中..."):
+    with st.spinner("☁ クラウド同期中..."):
         load_from_excel()
         defaults = {
             "df_Inventory": pd.DataFrame(columns=["食材名", "カテゴリ", "残量", "単位", "購入日"]),
@@ -324,17 +353,16 @@ with tab_create:
             sys_setting = st.session_state.df_Settings.set_index("Key")["Value"].to_dict() if not st.session_state.df_Settings.empty else {}
             blacklist_str = sys_setting.get("blacklist", "")
             
-            # ★ 調味料の材料化を厳格に禁止するプロンプト
             sys_prompt_template = f"""
             プロの料理研究家として【{{NUM}}品】のレシピを作成しJSON配列で出力せよ。
             【厳格ルール】
-            1. ingredients(材料)の分量は必ず「半角数値のみ(小数可)」。少々や適量は不可。
-            2. 【絶対厳守】調味料(塩、醤油、油、出汁など)は絶対に ingredients(材料) に含めないこと。調味料は seasonings に名前だけをリスト形式で記載せよ。調味料の分量は後で詳細手順を生成する際に記載するためここには不要。
-            3. 以下の食材は絶対に使用しないこと: {blacklist_str}
-            4. 以下のメニューは過去不評だったため絶対に提案しないこと: {low_rates}
+            1. ingredients(材料)の分量は必ず「半角数値のみ(小数可)」。
+            2. 【絶対厳守】調味料(塩、醤油、油、出汁など)は絶対に ingredients(材料) に含めず、seasonings(調味料) に名前だけをリスト形式で記載せよ。分量は作り方に記載。
+            3. 以下の食材は絶対に使用禁止: {blacklist_str}
+            4. 以下の過去不評メニューは絶対提案禁止: {low_rates}
             
             [フォーマット]
-            [{{ "name": "料理名", "intro": "紹介", "time": "15分", "ingredients": {{"豚肉": 200}}, "unit_map": {{"豚肉": "g"}}, "seasonings": {{"調味料": ["醤油"]}}, "steps": [{{"title": "下準備", "desc": "簡潔に"}}] }}]
+            [{{ "name": "料理名", "intro": "紹介", "time": "15分", "ingredients": {{"豚肉": 200}}, "unit_map": {{"豚肉": "g"}}, "seasonings": ["醤油", "みりん"], "steps": [{{"title": "下準備", "desc": "簡潔に"}}] }}]
             """
             res = batch_generate_recipes(req_prompt, sys_prompt_template, num_proposals)
             if res:
@@ -359,6 +387,7 @@ with tab_create:
                     st.write(f"**⏱ 予想調理時間:** {recipe.get('time', '不明')}")
                     ings = [f"{k} {v}{recipe.get('unit_map', {}).get(k, '')}" for k, v in recipe.get("ingredients", {}).items()]
                     st.write(f"**🛒 材料:** {', '.join(ings)}")
+                    st.write(f"**🧂 調味料:** {', '.join(recipe.get('seasonings', []))}")
                     st.write("**🍳 簡単な手順:**")
                     for step in recipe.get("steps", []):
                         st.write(f"・{step.get('title', '')}: {step.get('desc', '')}")
@@ -387,7 +416,7 @@ with tab_home:
                 if r.get("ai_alert"): st.warning(f"👨‍🍳 AIアドバイス:\n{r['ai_alert']}")
                 
                 st.markdown("#### 🔪 材料編集")
-                st.caption("※削除する場合は食材名を空欄にするか量を0に。一番下の空欄で追加。")
+                st.caption("※削除は食材名を空欄に。下部の空欄で追加。調味料はここには含めません。")
                 
                 current_ings = list(r.get("ingredients", {}).items())
                 current_ings.append(("", 0.0)) 
@@ -407,48 +436,59 @@ with tab_home:
                         new_units[val_name.strip()] = val_unt
                 
                 if st.button("💾 材料の変更を保存 (AIアラートもリセット)", key=f"save_ing_{i}"):
-                    st.session_state.final_plan[i]["ingredients"] = new_ings
-                    st.session_state.final_plan[i]["unit_map"] = new_units
+                    dummy_recipe = {"ingredients": new_ings, "unit_map": new_units, "seasonings": r.get("seasonings", [])}
+                    cleaned_recipe = sanitize_recipe(dummy_recipe) # ★ 手動入力された調味料も強制没収
+                    
+                    st.session_state.final_plan[i]["ingredients"] = cleaned_recipe["ingredients"]
+                    st.session_state.final_plan[i]["unit_map"] = cleaned_recipe["unit_map"]
+                    st.session_state.final_plan[i]["seasonings"] = cleaned_recipe["seasonings"]
                     st.session_state.final_plan[i]["ai_alert"] = ""
                     st.session_state.final_plan[i]["detailed_steps"] = "" 
                     
                     plan_str = json.dumps(st.session_state.final_plan, ensure_ascii=False)
                     st.session_state.df_MealPlan = pd.DataFrame([{"PlanJSON": base64.b64encode(plan_str.encode('utf-8')).decode('utf-8')}])
                     sync_shopping_list_with_plan()
-                    save_to_excel()
-                    clear_editor_cache(i)
-                    st.rerun()
+                    save_to_excel(); clear_editor_cache(i); st.rerun()
+
+                # ★ 調味料の有無表示
+                st.markdown("#### 🧂 調味料")
+                avail_s = st.session_state.df_Seasonings[st.session_state.df_Seasonings["在庫あり"] == True]["調味料名"].tolist()
+                seasonings = r.get("seasonings", [])
+                if seasonings:
+                    for s in seasonings:
+                        if find_closest_item(s, avail_s, 0.7): st.write(f"✔️ {s}")
+                        else: st.error(f"❌ {s} (買出しリストに自動追加済)")
+                else: st.caption("必要な調味料は特にありません")
 
                 st.markdown("#### 🍳 作り方")
                 if r.get("detailed_steps"): st.write(r.get("detailed_steps"))
                 else:
                     for step in r.get("steps", []): st.write(f"**{step.get('title', '')}**: {step.get('desc', '')}")
-                    if st.button("👨‍🍳 詳細レシピを生成 (AIが材料を添削)", key=f"pro_{i}", type="primary"):
+                    if st.button("👨‍🍳 詳細レシピを生成 (調味料の分量も明記)", key=f"pro_{i}", type="primary"):
                         with st.spinner("手順を執筆中..."):
-                            # ★ 詳細レシピ生成時に「調味料の分量」を必ず書かせるプロンプト
                             sys_prompt = f"""
                             以下の【ユーザーが編集した材料】と【調味料】に基づき詳細手順をJSONで出力せよ。
                             1. ユーザーの材料に極力従う。
                             2. 味が極端に薄い等、重大な欠陥がある場合のみ材料を補正し、その理由を `alerts` に記載。
-                            3. 【絶対厳守】詳細手順(`detailed_steps`)の中に、使用する調味料の具体的な分量（大さじ1、少々など）を必ず明記すること。
+                            3. 【絶対厳守】詳細手順(`detailed_steps`)の中に、各調味料の具体的な分量（大さじ1、少々など）を必ず明記すること。
                             
                             {{ "alerts": "補正理由(なければ空)", "suggested_ingredients": {{"食材": 100}}, "suggested_unit_map": {{"食材": "g"}}, "detailed_steps": "手順テキスト" }}
                             """
-                            req_data = f"料理名: {r['name']}\nユーザー材料: {new_ings}\n単位: {new_units}\n調味料: {r.get('seasonings', {})}"
+                            req_data = f"料理名: {r['name']}\nユーザー材料: {new_ings}\n単位: {new_units}\n調味料: {seasonings}"
                             ai_res = generate_via_gemini(req_data, sys_prompt, "json")
                             if ai_res:
                                 st.session_state.final_plan[i]["detailed_steps"] = ai_res.get("detailed_steps", "")
                                 if ai_res.get("alerts"):
                                     st.session_state.final_plan[i]["ai_alert"] = ai_res.get("alerts", "")
-                                    st.session_state.final_plan[i]["ingredients"] = ai_res.get("suggested_ingredients", new_ings)
-                                    st.session_state.final_plan[i]["unit_map"] = ai_res.get("suggested_unit_map", new_units)
+                                    dummy_r = {"ingredients": ai_res.get("suggested_ingredients", new_ings), "unit_map": ai_res.get("suggested_unit_map", new_units), "seasonings": seasonings}
+                                    cln_r = sanitize_recipe(dummy_r)
+                                    st.session_state.final_plan[i]["ingredients"] = cln_r["ingredients"]
+                                    st.session_state.final_plan[i]["unit_map"] = cln_r["unit_map"]
                                     sync_shopping_list_with_plan()
                                 
                                 plan_str = json.dumps(st.session_state.final_plan, ensure_ascii=False)
                                 st.session_state.df_MealPlan = pd.DataFrame([{"PlanJSON": base64.b64encode(plan_str.encode('utf-8')).decode('utf-8')}])
-                                save_to_excel()
-                                clear_editor_cache(i)
-                                st.rerun()
+                                save_to_excel(); clear_editor_cache(i); st.rerun()
                 
                 st.divider()
                 st.markdown("**評価をして調理完了**")
@@ -465,17 +505,13 @@ with tab_home:
                         plan_str = json.dumps(st.session_state.final_plan, ensure_ascii=False)
                         st.session_state.df_MealPlan = pd.DataFrame([{"PlanJSON": base64.b64encode(plan_str.encode('utf-8')).decode('utf-8')}])
                         sync_shopping_list_with_plan()
-                        save_to_excel()
-                        clear_editor_cache(i)
-                        st.success("消費記録完了！"); st.rerun()
+                        save_to_excel(); clear_editor_cache(i); st.success("消費記録完了！"); st.rerun()
                 if st.button("🗑️ この献立をキャンセル", key=f"del_{i}"):
                     st.session_state.final_plan.pop(i)
                     plan_str = json.dumps(st.session_state.final_plan, ensure_ascii=False)
                     st.session_state.df_MealPlan = pd.DataFrame([{"PlanJSON": base64.b64encode(plan_str.encode('utf-8')).decode('utf-8')}])
                     sync_shopping_list_with_plan()
-                    save_to_excel()
-                    clear_editor_cache(i)
-                    st.rerun()
+                    save_to_excel(); clear_editor_cache(i); st.rerun()
 
 # ------------------------------------------
 # Tab 3: 買出 & 手動追加 & AIプレビュー
@@ -490,8 +526,7 @@ with tab_shop:
             cat_guess = guess_category(manual_item.strip())
             new_row = pd.DataFrame([{"買出済": False, "食材名": manual_item.strip(), "カテゴリ": cat_guess, "必要量": 1, "単位": "個", "目的": "手動追加"}])
             st.session_state.df_ShoppingList = pd.concat([st.session_state.df_ShoppingList, new_row], ignore_index=True)
-            sync_shopping_list_with_plan() 
-            save_to_excel(); st.rerun()
+            sync_shopping_list_with_plan(); save_to_excel(); st.rerun()
 
     if len(st.session_state.df_ShoppingList) > 0:
         edited_shop = st.data_editor(st.session_state.df_ShoppingList, num_rows="dynamic", use_container_width=True, key="ed_shop",
@@ -503,17 +538,28 @@ with tab_shop:
             pending = edited_shop[edited_shop["買出済"] == False]
             inv_df = st.session_state.df_Inventory
             today = datetime.date.today()
+            
             for _, row in purchased.iterrows():
                 ing = row["食材名"]
-                actual_ing = find_closest_item(ing, inv_df["食材名"].tolist()) or ing
                 cat = row.get("カテゴリ", "その他")
-                log_transaction(actual_ing, cat, "購入", row["必要量"])
-                match_idx = inv_df[(inv_df["食材名"] == actual_ing)].index
-                if not match_idx.empty: inv_df.at[match_idx[0], "残量"] += float(row["必要量"])
+                
+                # ★ 調味料を買った場合、在庫ではなくマスターに連携する
+                if cat == "調味料":
+                    log_transaction(ing, cat, "購入", 1)
+                    s_df = st.session_state.df_Seasonings
+                    actual_s = find_closest_item(ing, s_df["調味料名"].tolist()) or ing
+                    match_idx = s_df[s_df["調味料名"] == actual_s].index
+                    if not match_idx.empty: s_df.at[match_idx[0], "在庫あり"] = True
+                    else: s_df = pd.concat([s_df, pd.DataFrame([{"調味料名": actual_s, "在庫あり": True}])], ignore_index=True)
+                    st.session_state.df_Seasonings = s_df
                 else:
-                    new_row = pd.DataFrame([{"食材名": actual_ing, "カテゴリ": cat, "残量": float(row["必要量"]), "単位": row["単位"], "購入日": today}])
-                    inv_df = pd.concat([inv_df, new_row], ignore_index=True)
-            st.session_state.df_Inventory = inv_df
+                    actual_ing = find_closest_item(ing, inv_df["食材名"].tolist()) or ing
+                    log_transaction(actual_ing, cat, "購入", row["必要量"])
+                    match_idx = inv_df[(inv_df["食材名"] == actual_ing)].index
+                    if not match_idx.empty: inv_df.at[match_idx[0], "残量"] += float(row["必要量"])
+                    else: inv_df = pd.concat([inv_df, pd.DataFrame([{"食材名": actual_ing, "カテゴリ": cat, "残量": float(row["必要量"]), "単位": row["単位"], "購入日": today}])], ignore_index=True)
+                    st.session_state.df_Inventory = inv_df
+                    
             st.session_state.df_ShoppingList = pending.reset_index(drop=True)
             sync_shopping_list_with_plan()
             save_to_excel(); st.rerun()
@@ -526,12 +572,10 @@ with tab_shop:
             with st.spinner("解読中..."):
                 base64_img = base64.b64encode(uploaded_file.read()).decode('utf-8')
                 sys_prompt = """レシート画像から食品を読み取りJSON出力せよ。
-                【絶対ルール】日用品(ラップ等)、割引額、税金、袋代など、食べられないものは絶対に除外すること。
-                【単位ルール】袋やパックは一般的な数値に換算せよ(ピーマン1袋→4個)。
+                【絶対ルール】日用品(ラップ等)、割引額、税金、袋代などは絶対に除外すること。袋やパックは個やgに換算せよ(ピーマン1袋→4個)。
                 [{"name": "食材名", "amount": 数量, "unit": "単位", "category": "青果等"}]"""
                 parsed_items = generate_via_gemini("データ化", sys_prompt, "json", base64_img)
-                if parsed_items:
-                    st.session_state.pending_receipt = parsed_items
+                if parsed_items: st.session_state.pending_receipt = parsed_items
                 else: st.error("解読失敗")
 
     if st.session_state.pending_receipt:
@@ -545,14 +589,25 @@ with tab_shop:
             for _, row in edited_preview.iterrows():
                 if pd.isna(row.get("name")): continue
                 ing = row["name"]
-                actual_ing = find_closest_item(ing, inv_df["食材名"].tolist()) or ing
+                cat = row.get("category", "その他")
                 amount = float(row.get("amount", 1))
-                log_transaction(actual_ing, row.get("category", "その他"), "購入", amount)
-                match_idx = inv_df[(inv_df["食材名"] == actual_ing)].index
-                if not match_idx.empty: inv_df.at[match_idx[0], "残量"] += amount
+                
+                if cat == "調味料":
+                    log_transaction(ing, cat, "購入", 1)
+                    s_df = st.session_state.df_Seasonings
+                    actual_s = find_closest_item(ing, s_df["調味料名"].tolist()) or ing
+                    match_idx = s_df[s_df["調味料名"] == actual_s].index
+                    if not match_idx.empty: s_df.at[match_idx[0], "在庫あり"] = True
+                    else: s_df = pd.concat([s_df, pd.DataFrame([{"調味料名": actual_s, "在庫あり": True}])], ignore_index=True)
+                    st.session_state.df_Seasonings = s_df
                 else:
-                    inv_df = pd.concat([inv_df, pd.DataFrame([{"食材名": actual_ing, "カテゴリ": row.get("category", "その他"), "残量": amount, "単位": row.get("unit", "個"), "購入日": today}])], ignore_index=True)
-            st.session_state.df_Inventory = inv_df
+                    actual_ing = find_closest_item(ing, inv_df["食材名"].tolist()) or ing
+                    log_transaction(actual_ing, cat, "購入", amount)
+                    match_idx = inv_df[(inv_df["食材名"] == actual_ing)].index
+                    if not match_idx.empty: inv_df.at[match_idx[0], "残量"] += amount
+                    else: inv_df = pd.concat([inv_df, pd.DataFrame([{"食材名": actual_ing, "カテゴリ": cat, "残量": amount, "単位": row.get("unit", "個"), "購入日": today}])], ignore_index=True)
+                    st.session_state.df_Inventory = inv_df
+                    
             st.session_state.pending_receipt = None
             sync_shopping_list_with_plan()
             save_to_excel(); st.success("追加完了！"); st.rerun()

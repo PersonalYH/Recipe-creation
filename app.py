@@ -27,16 +27,25 @@ SHEETS = ["Inventory", "ShoppingList", "Staples", "Seasonings", "PremadeSauces",
 def generate_via_gemini(prompt, sys_prompt=""):
     key = st.secrets.get("GEMINI_API_KEY")
     if not key: return None
-    payload = {"contents": [{"parts": [{"text": sys_prompt + "\n\n" + prompt}]}]}
+    
+    # 対策1: JSONフォーマットを強制し、途中で途切れるエラーを防ぐ
+    payload = {
+        "contents": [{"parts": [{"text": sys_prompt + "\n\n" + prompt}]}],
+        "generationConfig": {
+            "response_mime_type": "application/json",
+            "temperature": 0.7
+        }
+    }
     url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-lite:generateContent?key={key}"
     try:
         res = requests.post(url, headers={'Content-Type': 'application/json'}, json=payload)
         if res.status_code == 200:
             text = res.json()["candidates"][0]["content"]["parts"][0]["text"]
-            text = text.replace("```json", "").replace("```", "").strip()
-            return json.loads(text) if text.startswith("[") or text.startswith("{") else text
-    except Exception:
-        pass
+            return json.loads(text)
+        else:
+            st.error(f"APIエラー: {res.status_code}")
+    except Exception as e:
+        st.error(f"データ解析エラーが発生しました。AIの出力が長すぎる可能性があります。詳細: {e}")
     return None
 
 # ==========================================
@@ -202,52 +211,61 @@ tab_create, tab_home, tab_shop, tab_consume, tab_manage, tab_dash = st.tabs(["�
 with tab_create:
     st.header("献立の作成")
     mode = st.radio("作成モード", ["在庫消費優先", "リクエスト優先"], horizontal=True)
-    target_days = st.number_input("何日分作成しますか？", min_value=1, max_value=7, value=3)
+    target_days = st.number_input("何日分作成しますか？", min_value=1, max_value=7, value=1)
     
     req_prompt = ""
+    # 対策2: 在庫消費時は安全かつ多様な「10品」の出力を強制する
     if mode == "在庫消費優先":
         sorted_df = st.session_state.df_Inventory.sort_values(by="購入日", ascending=True)
         st.dataframe(sorted_df[["購入日", "食材名", "残量", "単位"]].head(5), use_container_width=True, hide_index=True)
         req_prompt = f"在庫データ(古い順): {sorted_df.to_json(orient='records', force_ascii=False)}\n"
-        num_proposals = target_days * 5 
+        num_proposals = 10 
     else:
         reqs = [st.text_input(f"Day {d+1} のリクエスト", key=f"r_{d}") for d in range(int(target_days))]
         req_prompt = f"リクエスト: {reqs}\n"
-        num_proposals = target_days * 2
+        num_proposals = max(2, target_days * 2)
 
     if st.button("✨ レシピ案を生成", type="primary", use_container_width=True):
-        with st.spinner("AIが考案中..."):
+        # 対策3: スピナーの文字で最新コードが反映されているか確認できるように変更
+        with st.spinner(f"AIが {num_proposals} 品の多様なレシピを考案中...（約10〜20秒かかります）"):
             hi_rates = st.session_state.df_Ratings[st.session_state.df_Ratings["評価"] >= 4]["レシピ名"].tolist()
             premades = st.session_state.df_PremadeSauces.to_json(orient='records', force_ascii=False)
-            
             stocked_seasonings = st.session_state.df_Seasonings[st.session_state.df_Seasonings["在庫あり"] == True]["調味料名"].tolist()
             
             sys_prompt = f"""
-            プロの料理研究家として以下のJSON配列を厳密に出力してください。
-            1. リクエストと消費食材に基づき最適なメニューを考案。可能な限り【家にある調味料】を活用すること。
+            あなたはプロの料理研究家です。以下の条件に従い、必ず【{num_proposals}品】の異なるレシピ案を作成し、JSON配列フォーマットで出力してください。
+            【厳守事項】出力されるJSON配列の要素数は、必ず「{num_proposals}個」にしてください。
+            
+            1. 提供された在庫データに基づき最適なメニューを考案。可能な限り【家にある調味料】を活用すること。
             2. 以下の高評価データから好みを推測して反映(再提案は厳禁)。【高評価】: {hi_rates}
-            3. 以下の「便利調味料リスト」に完全に合致する場合のみ、調合せずそれを使う手順を出力。【便利調味料】: {premades}
+            3. 「便利調味料リスト」に完全に合致する場合のみ、調合せずそれを使う手順を出力。【便利調味料】: {premades}
             4. 考案の際、以下の「現在家にある調味料」を最大限考慮してレシピを組み立ててください。【家にある調味料】: {stocked_seasonings}
             
-            [出力フォーマット]
+            [出力フォーマット(必ず配列で返すこと)]
             [{{"name": "料理名", "intro": "紹介", "ingredients": {{"豚肉": 200}}, "unit_map": {{"豚肉": "g"}}, "seasonings": {{"調味料": ["醤油"]}}, "steps": [{{"title": "下準備", "desc": "切る"}}], "tips": ["ポイント"]}}]
             """
-            res = generate_via_gemini(f"条件: {num_proposals}品のレシピ案を出力してください。2人前。\n" + req_prompt, sys_prompt)
+            res = generate_via_gemini(f"リクエスト: {req_prompt}", sys_prompt)
             if res:
                 st.session_state.draft_plan = res
                 st.session_state.selected_order = []
+            else:
+                st.error("⚠️ AIからのレシピ受け取りに失敗しました。もう一度ボタンを押してください。")
 
     if st.session_state.draft_plan:
         st.divider()
         st.markdown(f"**💡 採用するレシピを {target_days} つ選択**")
-        st.caption("※在庫消費優先モードの場合、多様な選択肢から選べるように多めにレシピを提案しています。")
+        st.caption("※多様な選択肢から選べるように多めにレシピを提案しています。")
         for i, recipe in enumerate(st.session_state.draft_plan):
             is_selected = (i in st.session_state.selected_order)
             badge = f"DAY {st.session_state.selected_order.index(i) + 1}" if is_selected else ""
             cols = st.columns([1, 8])
             with cols[0]:
                 if st.checkbox(" ", value=is_selected, key=f"sel_{i}"):
-                    if i not in st.session_state.selected_order: st.session_state.selected_order.append(i)
+                    if i not in st.session_state.selected_order: 
+                        if len(st.session_state.selected_order) < target_days:
+                            st.session_state.selected_order.append(i)
+                        else:
+                            st.warning(f"{target_days}日分すでに選択されています。")
                 else:
                     if i in st.session_state.selected_order: st.session_state.selected_order.remove(i)
             with cols[1]: st.markdown(f"{badge} **{recipe['name']}**", unsafe_allow_html=True)
@@ -385,27 +403,34 @@ with tab_shop:
     if st.button("🪄 解析して在庫に追加", use_container_width=True):
         with st.spinner("解析中..."):
             sys_prompt = """入力から食材名、数量、単位を抽出し、以下のJSON配列で出力してください。カテゴリは "青果", "精肉", "鮮魚", "日配品", "加工食品", "その他" から推測。[{"name": "食材名", "amount": 数量(数値), "unit": "単位", "category": "カテゴリ"}]"""
-            parsed_items = generate_via_gemini(voice_input, sys_prompt)
-            if parsed_items:
-                inv_df = st.session_state.df_Inventory
-                today = datetime.date.today()
-                added_str = []
-                for item in parsed_items:
-                    ing_name, amount = item.get("name"), float(item.get("amount", 1))
-                    log_transaction(ing_name, item.get("category", "その他"), "購入", amount)
-                    
-                    match_idx = inv_df[(inv_df["食材名"] == ing_name) & (inv_df["購入日"] == today)].index
-                    if not match_idx.empty: inv_df.at[match_idx[0], "残量"] += amount
-                    else:
-                        new_row = pd.DataFrame([{"食材名": ing_name, "カテゴリ": item.get("category", "その他"), "残量": amount, "単位": item.get("unit", "個"), "購入日": today}])
-                        inv_df = pd.concat([inv_df, new_row], ignore_index=True)
-                    
-                    added_str.append(f"{ing_name}({amount}{item.get('unit')})")
-                    reduce_shopping_list(ing_name, amount)
-                    
-                st.session_state.df_Inventory = inv_df
-                save_to_excel()
-                st.success(f"追加完了（クラウド保存済）: {', '.join(added_str)}")
+            
+            payload = {"contents": [{"parts": [{"text": sys_prompt + "\n\n" + voice_input}]}], "generationConfig": {"response_mime_type": "application/json"}}
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-lite:generateContent?key={st.secrets.get('GEMINI_API_KEY')}"
+            try:
+                res = requests.post(url, headers={'Content-Type': 'application/json'}, json=payload)
+                parsed_items = json.loads(res.json()["candidates"][0]["content"]["parts"][0]["text"])
+                if parsed_items:
+                    inv_df = st.session_state.df_Inventory
+                    today = datetime.date.today()
+                    added_str = []
+                    for item in parsed_items:
+                        ing_name, amount = item.get("name"), float(item.get("amount", 1))
+                        log_transaction(ing_name, item.get("category", "その他"), "購入", amount)
+                        
+                        match_idx = inv_df[(inv_df["食材名"] == ing_name) & (inv_df["購入日"] == today)].index
+                        if not match_idx.empty: inv_df.at[match_idx[0], "残量"] += amount
+                        else:
+                            new_row = pd.DataFrame([{"食材名": ing_name, "カテゴリ": item.get("category", "その他"), "残量": amount, "単位": item.get("unit", "個"), "購入日": today}])
+                            inv_df = pd.concat([inv_df, new_row], ignore_index=True)
+                        
+                        added_str.append(f"{ing_name}({amount}{item.get('unit')})")
+                        reduce_shopping_list(ing_name, amount)
+                        
+                    st.session_state.df_Inventory = inv_df
+                    save_to_excel()
+                    st.success(f"追加完了（クラウド保存済）: {', '.join(added_str)}")
+            except:
+                st.error("解析に失敗しました。")
 
 # ------------------------------------------
 # Tab 4: 個別消費 

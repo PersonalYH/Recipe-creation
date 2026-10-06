@@ -26,7 +26,6 @@ SHEETS = ["Inventory", "ShoppingList", "Staples", "Seasonings", "PremadeSauces",
 # 1. AI連携 & ユーティリティ
 # ==========================================
 def extract_json(text):
-    """AIの出力から確実なJSONを抽出する絶対パースエンジン"""
     text = text.replace("```json", "").replace("```", "").strip()
     idx_list = text.find('[')
     idx_dict = text.find('{')
@@ -110,7 +109,7 @@ def save_to_excel():
         st.error("⚠️ エクセルファイルがPC等で開かれロックされています。ファイルを閉じてから再度お試しください。")
         return False
     elif res.status_code >= 400:
-        st.error(f"⚠️️ 保存エラーが発生しました (コード: {res.status_code})")
+        st.error(f"⚠ 保存エラーが発生しました (コード: {res.status_code})")
         return False
     return True
 
@@ -160,11 +159,15 @@ def sync_shopping_list_with_plan():
     inv_total = st.session_state.df_Inventory.groupby("食材名")["残量"].sum().to_dict()
     inv_items_list = list(inv_total.keys())
     premade_list = st.session_state.df_PremadeSauces["商品名"].tolist()
+    seasonings_list = st.session_state.df_Seasonings["調味料名"].tolist() # ★ 調味料マスターを取得
+    
     needed_items = {}
 
     reserved = get_reserved_stock()
     for ing, reserved_amt in reserved.items():
         if find_closest_item(ing, premade_list): continue
+        if find_closest_item(ing, seasonings_list): continue # ★ 調味料は買出し計算から完全に除外
+        
         actual_ing = find_closest_item(ing, inv_items_list) or ing
         shortage = reserved_amt - float(inv_total.get(actual_ing, 0.0))
         if shortage > 0: needed_items[actual_ing] = {"amount": shortage, "unit": "個", "cat": "青果"}
@@ -183,7 +186,7 @@ def sync_shopping_list_with_plan():
     new_rows = []
     for ing, data in needed_items.items():
         cat = data["cat"]
-        if cat == "青果": cat = guess_category(ing) # AIダミーから再推測
+        if cat == "青果": cat = guess_category(ing)
         
         final_amt = data["amount"]
         if data["unit"] in ["本", "個", "玉", "袋", "パック"]:
@@ -204,7 +207,11 @@ def sync_shopping_list_with_plan():
 def consume_fifo(ingredients_dict):
     df = st.session_state.df_Inventory
     inv_items = df["食材名"].unique().tolist()
+    seasonings_list = st.session_state.df_Seasonings["調味料名"].tolist() # ★ 調味料マスターを取得
+    
     for req_ing, req_amt in ingredients_dict.items():
+        if find_closest_item(req_ing, seasonings_list): continue # ★ 調味料は在庫消費計算から完全に除外
+        
         actual_ing = find_closest_item(req_ing, inv_items)
         if not actual_ing: continue 
         remaining = float(req_amt)
@@ -246,7 +253,7 @@ with st.sidebar:
         st.success("保存しました")
 
 if "data_loaded" not in st.session_state or not st.session_state.data_loaded:
-    with st.spinner("☁️ クラウド同期中..."):
+    with st.spinner("☁️️ クラウド同期中..."):
         load_from_excel()
         defaults = {
             "df_Inventory": pd.DataFrame(columns=["食材名", "カテゴリ", "残量", "単位", "購入日"]),
@@ -317,11 +324,14 @@ with tab_create:
             sys_setting = st.session_state.df_Settings.set_index("Key")["Value"].to_dict() if not st.session_state.df_Settings.empty else {}
             blacklist_str = sys_setting.get("blacklist", "")
             
+            # ★ 調味料の材料化を厳格に禁止するプロンプト
             sys_prompt_template = f"""
             プロの料理研究家として【{{NUM}}品】のレシピを作成しJSON配列で出力せよ。
-            【厳格ルール】分量は必ず「半角数値のみ(小数可)」。少々や適量は不可。
-            【禁止食材】以下は絶対に使用しないこと: {blacklist_str}
-            【不評ブロック】以下のメニューは過去不評だったため絶対に提案しないこと: {low_rates}
+            【厳格ルール】
+            1. ingredients(材料)の分量は必ず「半角数値のみ(小数可)」。少々や適量は不可。
+            2. 【絶対厳守】調味料(塩、醤油、油、出汁など)は絶対に ingredients(材料) に含めないこと。調味料は seasonings に名前だけをリスト形式で記載せよ。調味料の分量は後で詳細手順を生成する際に記載するためここには不要。
+            3. 以下の食材は絶対に使用しないこと: {blacklist_str}
+            4. 以下のメニューは過去不評だったため絶対に提案しないこと: {low_rates}
             
             [フォーマット]
             [{{ "name": "料理名", "intro": "紹介", "time": "15分", "ingredients": {{"豚肉": 200}}, "unit_map": {{"豚肉": "g"}}, "seasonings": {{"調味料": ["醤油"]}}, "steps": [{{"title": "下準備", "desc": "簡潔に"}}] }}]
@@ -366,7 +376,7 @@ with tab_create:
             st.success("確定しました！「📅 確定」タブへ。"); st.rerun()
 
 # ------------------------------------------
-# Tab 2: 献立確定 (材料編集ゴースト消去対応)
+# Tab 2: 献立確定
 # ------------------------------------------
 with tab_home:
     st.header("📅 確定した献立")
@@ -387,9 +397,7 @@ with tab_home:
                     ing_unit = r.get("unit_map", {}).get(ing_name, "個") if ing_name else "個"
                     c1, c2, c3 = st.columns([5, 3, 3])
                     
-                    # ゴースト対策: 行インデックスではなく食材名をキーに含める
                     safe_key = f"{i}_{ing_name if ing_name else 'new_' + str(ing_idx)}"
-                    
                     val_name = c1.text_input("食材", value=ing_name, key=f"n_{safe_key}", placeholder="追加", label_visibility="collapsed")
                     val_amt = c2.number_input("量", value=float(ing_amt), min_value=0.0, step=0.5, key=f"a_{safe_key}", label_visibility="collapsed")
                     val_unt = c3.selectbox("単位", UNIT_OPTIONS, index=UNIT_OPTIONS.index(ing_unit) if ing_unit in UNIT_OPTIONS else 1, key=f"u_{safe_key}", label_visibility="collapsed")
@@ -408,7 +416,7 @@ with tab_home:
                     st.session_state.df_MealPlan = pd.DataFrame([{"PlanJSON": base64.b64encode(plan_str.encode('utf-8')).decode('utf-8')}])
                     sync_shopping_list_with_plan()
                     save_to_excel()
-                    clear_editor_cache(i) # キャッシュクリアによる画面の完全再描画
+                    clear_editor_cache(i)
                     st.rerun()
 
                 st.markdown("#### 🍳 作り方")
@@ -417,13 +425,16 @@ with tab_home:
                     for step in r.get("steps", []): st.write(f"**{step.get('title', '')}**: {step.get('desc', '')}")
                     if st.button("👨‍🍳 詳細レシピを生成 (AIが材料を添削)", key=f"pro_{i}", type="primary"):
                         with st.spinner("手順を執筆中..."):
+                            # ★ 詳細レシピ生成時に「調味料の分量」を必ず書かせるプロンプト
                             sys_prompt = f"""
-                            以下の【ユーザーが編集した材料】に基づき詳細手順をJSONで出力せよ。
+                            以下の【ユーザーが編集した材料】と【調味料】に基づき詳細手順をJSONで出力せよ。
                             1. ユーザーの材料に極力従う。
                             2. 味が極端に薄い等、重大な欠陥がある場合のみ材料を補正し、その理由を `alerts` に記載。
+                            3. 【絶対厳守】詳細手順(`detailed_steps`)の中に、使用する調味料の具体的な分量（大さじ1、少々など）を必ず明記すること。
+                            
                             {{ "alerts": "補正理由(なければ空)", "suggested_ingredients": {{"食材": 100}}, "suggested_unit_map": {{"食材": "g"}}, "detailed_steps": "手順テキスト" }}
                             """
-                            req_data = f"料理名: {r['name']}\nユーザー材料: {new_ings}\n単位: {new_units}"
+                            req_data = f"料理名: {r['name']}\nユーザー材料: {new_ings}\n単位: {new_units}\n調味料: {r.get('seasonings', {})}"
                             ai_res = generate_via_gemini(req_data, sys_prompt, "json")
                             if ai_res:
                                 st.session_state.final_plan[i]["detailed_steps"] = ai_res.get("detailed_steps", "")

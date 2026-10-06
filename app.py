@@ -61,7 +61,6 @@ def generate_via_gemini(prompt, sys_prompt="", response_type="json", image_b64=N
     return None
 
 def batch_generate_recipes(req_prompt, sys_prompt_template, total_needed):
-    """AIエラーを防ぐ分割バッチ生成エンジン"""
     all_recipes = []
     remaining = total_needed
     while remaining > 0:
@@ -76,15 +75,13 @@ def batch_generate_recipes(req_prompt, sys_prompt_template, total_needed):
     return all_recipes
 
 def guess_category(item_name):
-    """手動追加用・カテゴリ簡易推測エンジン"""
-    if any(x in item_name for x in ["肉", "豚", "牛", "鶏"]): return "精肉"
-    if any(x in item_name for x in ["魚", "鮭", "鯖", "えび", "イカ"]): return "鮮魚"
-    if any(x in item_name for x in ["野菜", "玉ねぎ", "人参", "キャベツ", "トマト", "ネギ", "ピーマン", "大根"]): return "青果"
-    if any(x in item_name for x in ["牛乳", "卵", "チーズ", "ヨーグルト"]): return "日配品"
+    if any(x in item_name for x in ["肉", "豚", "牛", "鶏", "ウインナー"]): return "精肉"
+    if any(x in item_name for x in ["魚", "鮭", "鯖", "えび", "イカ", "タコ"]): return "鮮魚"
+    if any(x in item_name for x in ["野菜", "玉ねぎ", "人参", "キャベツ", "トマト", "ネギ", "ピーマン", "大根", "きのこ"]): return "青果"
+    if any(x in item_name for x in ["牛乳", "卵", "チーズ", "ヨーグルト", "豆腐", "納豆"]): return "日配品"
     return "その他"
 
 def round_half_step(num):
-    """正確に0.5刻みへ四捨五入する補正ロジック"""
     return math.floor(num * 2 + 0.5) / 2
 
 # ==========================================
@@ -108,13 +105,12 @@ def save_to_excel():
     output.seek(0)
     url = "https://graph.microsoft.com/v1.0/me/drive/root:/MealAppDB.xlsx:/content"
     
-    # 409(競合) または 423(ロック) エラーをキャッチ
     res = requests.put(url, headers={"Authorization": f"Bearer {token}", "Content-Type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"}, data=output.read())
     if res.status_code in [409, 423]:
         st.error("⚠️ エクセルファイルがPC等で開かれロックされています。ファイルを閉じてから再度お試しください。")
         return False
     elif res.status_code >= 400:
-        st.error(f"⚠️ 保存エラーが発生しました (コード: {res.status_code})")
+        st.error(f"⚠️️ 保存エラーが発生しました (コード: {res.status_code})")
         return False
     return True
 
@@ -187,9 +183,7 @@ def sync_shopping_list_with_plan():
     new_rows = []
     for ing, data in needed_items.items():
         cat = data["cat"]
-        if "肉" in ing: cat = "精肉"
-        elif "魚" in ing or "鮭" in ing: cat = "鮮魚"
-        elif data["unit"] in ["g", "玉", "本", "束"]: cat = "青果"
+        if cat == "青果": cat = guess_category(ing) # AIダミーから再推測
         
         final_amt = data["amount"]
         if data["unit"] in ["本", "個", "玉", "袋", "パック"]:
@@ -224,18 +218,16 @@ def consume_fifo(ingredients_dict):
             if current <= remaining: remaining -= current; df.at[idx, "残量"] = 0.0
             else: df.at[idx, "残量"] = current - remaining; remaining = 0.0
             
-    # お掃除ロジック（計算誤差の破棄）
     df = df[df["残量"] >= 0.1].reset_index(drop=True)
     st.session_state.df_Inventory = df
 
 def clear_editor_cache(plan_idx):
-    """UIメモリ（キャッシュ）の強制リセット"""
     for k in list(st.session_state.keys()):
         if k.startswith(f"n_{plan_idx}_") or k.startswith(f"a_{plan_idx}_") or k.startswith(f"u_{plan_idx}_"):
             del st.session_state[k]
 
 # ==========================================
-# 4. 初期化 & 設定ロード
+# 4. 初期化 & 恒久設定
 # ==========================================
 with st.sidebar:
     st.header("🔑 システム設定")
@@ -337,7 +329,7 @@ with tab_create:
             res = batch_generate_recipes(req_prompt, sys_prompt_template, num_proposals)
             if res:
                 st.session_state.draft_plan = res; st.session_state.selected_order = []
-            else: st.error("⚠ エラーが発生しました。")
+            else: st.error("⚠ エラーが発生しました。時間を置いて再試行してください。")
 
     if st.session_state.draft_plan:
         st.divider()
@@ -374,7 +366,7 @@ with tab_create:
             st.success("確定しました！「📅 確定」タブへ。"); st.rerun()
 
 # ------------------------------------------
-# Tab 2: 献立確定
+# Tab 2: 献立確定 (材料編集ゴースト消去対応)
 # ------------------------------------------
 with tab_home:
     st.header("📅 確定した献立")
@@ -385,7 +377,7 @@ with tab_home:
                 if r.get("ai_alert"): st.warning(f"👨‍🍳 AIアドバイス:\n{r['ai_alert']}")
                 
                 st.markdown("#### 🔪 材料編集")
-                st.caption("※削除する場合は『食材名』を空にするか、『量』を0に。一番下の空欄で追加。")
+                st.caption("※削除する場合は食材名を空欄にするか量を0に。一番下の空欄で追加。")
                 
                 current_ings = list(r.get("ingredients", {}).items())
                 current_ings.append(("", 0.0)) 
@@ -394,9 +386,13 @@ with tab_home:
                 for ing_idx, (ing_name, ing_amt) in enumerate(current_ings):
                     ing_unit = r.get("unit_map", {}).get(ing_name, "個") if ing_name else "個"
                     c1, c2, c3 = st.columns([5, 3, 3])
-                    val_name = c1.text_input("食材", value=ing_name, key=f"n_{i}_{ing_idx}", placeholder="追加する食材", label_visibility="collapsed")
-                    val_amt = c2.number_input("量", value=float(ing_amt), min_value=0.0, step=0.5, key=f"a_{i}_{ing_idx}", label_visibility="collapsed")
-                    val_unt = c3.selectbox("単位", UNIT_OPTIONS, index=UNIT_OPTIONS.index(ing_unit) if ing_unit in UNIT_OPTIONS else 1, key=f"u_{i}_{ing_idx}", label_visibility="collapsed")
+                    
+                    # ゴースト対策: 行インデックスではなく食材名をキーに含める
+                    safe_key = f"{i}_{ing_name if ing_name else 'new_' + str(ing_idx)}"
+                    
+                    val_name = c1.text_input("食材", value=ing_name, key=f"n_{safe_key}", placeholder="追加", label_visibility="collapsed")
+                    val_amt = c2.number_input("量", value=float(ing_amt), min_value=0.0, step=0.5, key=f"a_{safe_key}", label_visibility="collapsed")
+                    val_unt = c3.selectbox("単位", UNIT_OPTIONS, index=UNIT_OPTIONS.index(ing_unit) if ing_unit in UNIT_OPTIONS else 1, key=f"u_{safe_key}", label_visibility="collapsed")
                     
                     if val_name.strip() != "" and val_amt > 0:
                         new_ings[val_name.strip()] = val_amt
@@ -412,7 +408,7 @@ with tab_home:
                     st.session_state.df_MealPlan = pd.DataFrame([{"PlanJSON": base64.b64encode(plan_str.encode('utf-8')).decode('utf-8')}])
                     sync_shopping_list_with_plan()
                     save_to_excel()
-                    clear_editor_cache(i) # キャッシュクリア
+                    clear_editor_cache(i) # キャッシュクリアによる画面の完全再描画
                     st.rerun()
 
                 st.markdown("#### 🍳 作り方")
@@ -439,7 +435,9 @@ with tab_home:
                                 
                                 plan_str = json.dumps(st.session_state.final_plan, ensure_ascii=False)
                                 st.session_state.df_MealPlan = pd.DataFrame([{"PlanJSON": base64.b64encode(plan_str.encode('utf-8')).decode('utf-8')}])
-                                save_to_excel(); st.rerun()
+                                save_to_excel()
+                                clear_editor_cache(i)
+                                st.rerun()
                 
                 st.divider()
                 st.markdown("**評価をして調理完了**")
@@ -481,7 +479,7 @@ with tab_shop:
             cat_guess = guess_category(manual_item.strip())
             new_row = pd.DataFrame([{"買出済": False, "食材名": manual_item.strip(), "カテゴリ": cat_guess, "必要量": 1, "単位": "個", "目的": "手動追加"}])
             st.session_state.df_ShoppingList = pd.concat([st.session_state.df_ShoppingList, new_row], ignore_index=True)
-            sync_shopping_list_with_plan() # 並び替えを実行
+            sync_shopping_list_with_plan() 
             save_to_excel(); st.rerun()
 
     if len(st.session_state.df_ShoppingList) > 0:

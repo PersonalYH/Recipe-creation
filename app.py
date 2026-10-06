@@ -2,7 +2,6 @@ import streamlit as st
 import pandas as pd
 import requests
 import json
-import difflib
 import datetime
 import io
 import msal
@@ -28,24 +27,29 @@ def generate_via_gemini(prompt, sys_prompt=""):
     key = st.secrets.get("GEMINI_API_KEY")
     if not key: return None
     
-    # 対策1: JSONフォーマットを強制し、途中で途切れるエラーを防ぐ
+    # 503エラー対策: 特殊なJSONモードを外し、シンプルなテキスト生成に戻す
     payload = {
         "contents": [{"parts": [{"text": sys_prompt + "\n\n" + prompt}]}],
-        "generationConfig": {
-            "response_mime_type": "application/json",
-            "temperature": 0.7
-        }
+        "generationConfig": {"temperature": 0.7}
     }
     url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-lite:generateContent?key={key}"
+    
     try:
-        res = requests.post(url, headers={'Content-Type': 'application/json'}, json=payload)
+        # 503エラー対策: タイムアウト時間を60秒に延長して待機する
+        res = requests.post(url, headers={'Content-Type': 'application/json'}, json=payload, timeout=60)
         if res.status_code == 200:
             text = res.json()["candidates"][0]["content"]["parts"][0]["text"]
+            # 不要な文字を取り除き、純粋なJSON配列だけを抽出する
+            text = text.replace("```json", "").replace("```", "").strip()
+            start_idx = text.find('[')
+            end_idx = text.rfind(']') + 1
+            if start_idx != -1 and end_idx != -1:
+                return json.loads(text[start_idx:end_idx])
             return json.loads(text)
         else:
             st.error(f"APIエラー: {res.status_code}")
     except Exception as e:
-        st.error(f"データ解析エラーが発生しました。AIの出力が長すぎる可能性があります。詳細: {e}")
+        st.error(f"データ解析エラーが発生しました。サーバーが混雑しているか、出力が長すぎます。詳細: {e}")
     return None
 
 # ==========================================
@@ -214,27 +218,27 @@ with tab_create:
     target_days = st.number_input("何日分作成しますか？", min_value=1, max_value=7, value=1)
     
     req_prompt = ""
-    # 対策2: 在庫消費時は安全かつ多様な「10品」の出力を強制する
+    # 503エラー対策: 10品だとサーバーが落ちるため、安全かつ安定する「5品」に設定
     if mode == "在庫消費優先":
         sorted_df = st.session_state.df_Inventory.sort_values(by="購入日", ascending=True)
         st.dataframe(sorted_df[["購入日", "食材名", "残量", "単位"]].head(5), use_container_width=True, hide_index=True)
         req_prompt = f"在庫データ(古い順): {sorted_df.to_json(orient='records', force_ascii=False)}\n"
-        num_proposals = 10 
+        num_proposals = 5 
     else:
         reqs = [st.text_input(f"Day {d+1} のリクエスト", key=f"r_{d}") for d in range(int(target_days))]
         req_prompt = f"リクエスト: {reqs}\n"
         num_proposals = max(2, target_days * 2)
 
     if st.button("✨ レシピ案を生成", type="primary", use_container_width=True):
-        # 対策3: スピナーの文字で最新コードが反映されているか確認できるように変更
         with st.spinner(f"AIが {num_proposals} 品の多様なレシピを考案中...（約10〜20秒かかります）"):
             hi_rates = st.session_state.df_Ratings[st.session_state.df_Ratings["評価"] >= 4]["レシピ名"].tolist()
             premades = st.session_state.df_PremadeSauces.to_json(orient='records', force_ascii=False)
             stocked_seasonings = st.session_state.df_Seasonings[st.session_state.df_Seasonings["在庫あり"] == True]["調味料名"].tolist()
             
+            # 503エラー対策: 文字数を減らすために手順（steps）を簡潔にするよう指示を追加
             sys_prompt = f"""
             あなたはプロの料理研究家です。以下の条件に従い、必ず【{num_proposals}品】の異なるレシピ案を作成し、JSON配列フォーマットで出力してください。
-            【厳守事項】出力されるJSON配列の要素数は、必ず「{num_proposals}個」にしてください。
+            【厳守事項】出力されるJSON配列の要素数は必ず「{num_proposals}個」とし、サーバー負荷軽減のため各レシピの「steps（手順）」は極力簡潔な短い文章で書いてください。
             
             1. 提供された在庫データに基づき最適なメニューを考案。可能な限り【家にある調味料】を活用すること。
             2. 以下の高評価データから好みを推測して反映(再提案は厳禁)。【高評価】: {hi_rates}
@@ -242,14 +246,12 @@ with tab_create:
             4. 考案の際、以下の「現在家にある調味料」を最大限考慮してレシピを組み立ててください。【家にある調味料】: {stocked_seasonings}
             
             [出力フォーマット(必ず配列で返すこと)]
-            [{{"name": "料理名", "intro": "紹介", "ingredients": {{"豚肉": 200}}, "unit_map": {{"豚肉": "g"}}, "seasonings": {{"調味料": ["醤油"]}}, "steps": [{{"title": "下準備", "desc": "切る"}}], "tips": ["ポイント"]}}]
+            [{{"name": "料理名", "intro": "紹介", "ingredients": {{"豚肉": 200}}, "unit_map": {{"豚肉": "g"}}, "seasonings": {{"調味料": ["醤油"]}}, "steps": [{{"title": "下準備", "desc": "簡潔に切る等"}}], "tips": ["ポイント"]}}]
             """
             res = generate_via_gemini(f"リクエスト: {req_prompt}", sys_prompt)
             if res:
                 st.session_state.draft_plan = res
                 st.session_state.selected_order = []
-            else:
-                st.error("⚠️ AIからのレシピ受け取りに失敗しました。もう一度ボタンを押してください。")
 
     if st.session_state.draft_plan:
         st.divider()
@@ -404,11 +406,16 @@ with tab_shop:
         with st.spinner("解析中..."):
             sys_prompt = """入力から食材名、数量、単位を抽出し、以下のJSON配列で出力してください。カテゴリは "青果", "精肉", "鮮魚", "日配品", "加工食品", "その他" から推測。[{"name": "食材名", "amount": 数量(数値), "unit": "単位", "category": "カテゴリ"}]"""
             
-            payload = {"contents": [{"parts": [{"text": sys_prompt + "\n\n" + voice_input}]}], "generationConfig": {"response_mime_type": "application/json"}}
+            payload = {"contents": [{"parts": [{"text": sys_prompt + "\n\n" + voice_input}]}], "generationConfig": {"temperature": 0.7}}
             url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-lite:generateContent?key={st.secrets.get('GEMINI_API_KEY')}"
             try:
-                res = requests.post(url, headers={'Content-Type': 'application/json'}, json=payload)
-                parsed_items = json.loads(res.json()["candidates"][0]["content"]["parts"][0]["text"])
+                res = requests.post(url, headers={'Content-Type': 'application/json'}, json=payload, timeout=30)
+                text = res.json()["candidates"][0]["content"]["parts"][0]["text"]
+                text = text.replace("```json", "").replace("```", "").strip()
+                start_idx = text.find('[')
+                end_idx = text.rfind(']') + 1
+                parsed_items = json.loads(text[start_idx:end_idx]) if start_idx != -1 else json.loads(text)
+                
                 if parsed_items:
                     inv_df = st.session_state.df_Inventory
                     today = datetime.date.today()

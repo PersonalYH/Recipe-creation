@@ -13,15 +13,7 @@ import msal
 st.set_page_config(page_title="献立＆買出しアプリ", layout="wide", initial_sidebar_state="collapsed")
 
 st.markdown("""
-    <style>
-    div[data-testid="stTabs"] > div:nth-child(1) {
-        position: sticky; top: 0; z-index: 999; background-color: white;
-        padding-top: 10px; padding-bottom: 5px; border-bottom: 1px solid #e6e6e6;
-    }
-    .block-container { padding-top: 2rem !important; padding-bottom: 5rem !important; }
-    .day-badge { color: white; background-color: #E03C31; padding: 3px 8px; border-radius: 4px; font-size: 0.85em; font-weight: bold; margin-right: 8px; }
-    .st-emotion-cache-1v0mbdj { margin-top: -15px; } /* UIの隙間微調整 */
-    </style>
+    
 """, unsafe_allow_html=True)
 
 # 定数
@@ -115,7 +107,6 @@ if "data_loaded" not in st.session_state or not st.session_state.data_loaded:
     with st.spinner("☁️ クラウドと同期中..."):
         load_from_excel()
         
-        # 新規追加のシート（MealPlan含む）を補完
         defaults = {
             "df_Inventory": pd.DataFrame([{"食材名": "豚肉", "カテゴリ": "精肉", "残量": 200.0, "単位": "g", "購入日": datetime.date.today()}]),
             "df_ShoppingList": pd.DataFrame(columns=["買出済", "食材名", "カテゴリ", "必要量", "単位", "目的"]),
@@ -135,7 +126,6 @@ if "data_loaded" not in st.session_state or not st.session_state.data_loaded:
                 
         if needs_save: save_to_excel()
         
-        # クラウドから読み込んだ献立（JSON）を復元 (①の対策)
         st.session_state.final_plan = []
         df_plan = st.session_state.get("df_MealPlan")
         if df_plan is not None and not df_plan.empty:
@@ -149,7 +139,6 @@ def log_transaction(item, category, io_type, amount):
     new_log = pd.DataFrame([{"日時": datetime.datetime.now(), "食材名": item, "カテゴリ": category, "入出庫": io_type, "数量": amount}])
     st.session_state.df_TransactionLog = pd.concat([st.session_state.df_TransactionLog, new_log], ignore_index=True)
 
-# ★④の対策: 全上書きではなく、「不足分を追加」するだけの関数に改修
 def add_shortages_from_plan():
     req_dict = {}
     for r in st.session_state.final_plan:
@@ -171,7 +160,6 @@ def add_shortages_from_plan():
     if new_items:
         st.session_state.df_ShoppingList = pd.concat([shop_df, pd.DataFrame(new_items)], ignore_index=True)
 
-# 在庫が増えた時に買い出しリストの量を自動で減らす処理
 def reduce_shopping_list(ing, added_amt):
     shop_df = st.session_state.df_ShoppingList
     idx = shop_df[shop_df["食材名"] == ing].index
@@ -217,29 +205,36 @@ with tab_create:
     target_days = st.number_input("何日分作成しますか？", min_value=1, max_value=7, value=3)
     
     req_prompt = ""
+    # ②の対策: 在庫消費優先時はレシピ提案数を15品に大幅拡大（エラー回避の安全圏）
     if mode == "在庫消費優先":
         sorted_df = st.session_state.df_Inventory.sort_values(by="購入日", ascending=True)
         st.dataframe(sorted_df[["購入日", "食材名", "残量", "単位"]].head(5), use_container_width=True, hide_index=True)
         req_prompt = f"在庫データ(古い順): {sorted_df.to_json(orient='records', force_ascii=False)}\n"
+        num_proposals = 15 
     else:
         reqs = [st.text_input(f"Day {d+1} のリクエスト", key=f"r_{d}") for d in range(int(target_days))]
         req_prompt = f"リクエスト: {reqs}\n"
+        num_proposals = target_days * 2
 
     if st.button("✨ レシピ案を生成", type="primary", use_container_width=True):
         with st.spinner("AIが考案中..."):
             hi_rates = st.session_state.df_Ratings[st.session_state.df_Ratings["評価"] >= 4]["レシピ名"].tolist()
             premades = st.session_state.df_PremadeSauces.to_json(orient='records', force_ascii=False)
             
+            # ③の対策: 家にある調味料のリストを抽出し、AIに読み込ませる
+            stocked_seasonings = st.session_state.df_Seasonings[st.session_state.df_Seasonings["在庫あり"] == True]["調味料名"].tolist()
+            
             sys_prompt = f"""
             プロの料理研究家として以下のJSON配列を厳密に出力してください。
-            1. リクエストと消費食材に基づき最適なメニューを考案。
+            1. リクエストと消費食材に基づき最適なメニューを考案。可能な限り【家にある調味料】を活用すること。
             2. 以下の高評価データから好みを推測して反映(再提案は厳禁)。【高評価】: {hi_rates}
             3. 以下の「便利調味料リスト」に完全に合致する場合のみ、調合せずそれを使う手順を出力。【便利調味料】: {premades}
+            4. 考案の際、以下の「現在家にある調味料」を最大限考慮してレシピを組み立ててください。【家にある調味料】: {stocked_seasonings}
             
             [出力フォーマット]
             [{{"name": "料理名", "intro": "紹介", "ingredients": {{"豚肉": 200}}, "unit_map": {{"豚肉": "g"}}, "seasonings": {{"調味料": ["醤油"]}}, "steps": [{{"title": "下準備", "desc": "切る"}}], "tips": ["ポイント"]}}]
             """
-            res = generate_via_gemini(f"条件: {target_days * 2}品提案。2人前。\n" + req_prompt, sys_prompt)
+            res = generate_via_gemini(f"条件: {num_proposals}品のレシピ案を出力してください。2人前。\n" + req_prompt, sys_prompt)
             if res:
                 st.session_state.draft_plan = res
                 st.session_state.selected_order = []
@@ -247,9 +242,10 @@ with tab_create:
     if st.session_state.draft_plan:
         st.divider()
         st.markdown(f"**💡 採用するレシピを {target_days} つ選択**")
+        st.caption("※在庫消費優先モードの場合、多様な選択肢から選べるように多めにレシピを提案しています。")
         for i, recipe in enumerate(st.session_state.draft_plan):
             is_selected = (i in st.session_state.selected_order)
-            badge = f"<span class='day-badge'>DAY {st.session_state.selected_order.index(i) + 1}</span>" if is_selected else ""
+            badge = f"DAY {st.session_state.selected_order.index(i) + 1}" if is_selected else ""
             cols = st.columns([1, 8])
             with cols[0]:
                 if st.checkbox(" ", value=is_selected, key=f"sel_{i}"):
@@ -259,11 +255,10 @@ with tab_create:
             with cols[1]: st.markdown(f"{badge} **{recipe['name']}**", unsafe_allow_html=True)
                 
         if len(st.session_state.selected_order) > 0 and st.button("✅ 確定する", type="primary", use_container_width=True):
-            # ①の対策: 献立をJSON化してMealPlanシートに保存
             st.session_state.final_plan = [st.session_state.draft_plan[idx] for idx in st.session_state.selected_order]
             st.session_state.df_MealPlan = pd.DataFrame([{"PlanJSON": json.dumps(st.session_state.final_plan, ensure_ascii=False)}])
             
-            add_shortages_from_plan() # ④の対策: 確定時にだけ不足分を追加
+            add_shortages_from_plan() 
             save_to_excel()
             
             st.session_state.draft_plan = []
@@ -316,7 +311,6 @@ with tab_home:
                         new_rating = pd.DataFrame([{"日時": datetime.datetime.now(), "レシピ名": r['name'], "評価": rating}])
                         st.session_state.df_Ratings = pd.concat([st.session_state.df_Ratings, new_rating], ignore_index=True)
                         
-                        # ①の対策: 終わった献立はリストから消し、クラウドを上書きする
                         st.session_state.final_plan.pop(i)
                         st.session_state.df_MealPlan = pd.DataFrame([{"PlanJSON": json.dumps(st.session_state.final_plan, ensure_ascii=False)}])
                         
@@ -325,12 +319,11 @@ with tab_home:
                         st.rerun()
 
 # ------------------------------------------
-# Tab 3: 買出しリスト (手動削除対応)
+# Tab 3: 買出しリスト
 # ------------------------------------------
 with tab_shop:
     st.header("🛒 買出しリスト")
     
-    # 定番品のチェック・追加を独立したボタンに分離 (④の対策)
     if st.button("🔄 定番アイテムの不足分をリストに追加", use_container_width=True):
         inv_total = st.session_state.df_Inventory.groupby("食材名")["残量"].sum().to_dict()
         shop_df = st.session_state.df_ShoppingList
@@ -355,10 +348,15 @@ with tab_shop:
     if len(st.session_state.df_ShoppingList) == 0:
         st.info("買い出しが必要な食材はありません。")
     else:
+        # ①の対策: 買出しリストのカテゴリと単位にも入力規則(プルダウン)を設定
         edited_shop = st.data_editor(st.session_state.df_ShoppingList, num_rows="dynamic", use_container_width=True, key="ed_shop",
-            column_config={"買出済": st.column_config.CheckboxColumn("買出済", default=False), "目的": st.column_config.TextColumn(disabled=True)})
+            column_config={
+                "買出済": st.column_config.CheckboxColumn("買出済", default=False), 
+                "目的": st.column_config.TextColumn(disabled=True),
+                "カテゴリ": st.column_config.SelectboxColumn(options=CATEGORY_OPTIONS),
+                "単位": st.column_config.SelectboxColumn(options=UNIT_OPTIONS)
+            })
         
-        # ユーザーが行の削除(Deleteキー)等の直接編集を行った場合、そのままクラウドに保存 (④の対策)
         if not edited_shop.equals(st.session_state.df_ShoppingList):
             st.session_state.df_ShoppingList = edited_shop
             save_to_excel()
@@ -406,7 +404,7 @@ with tab_shop:
                         inv_df = pd.concat([inv_df, new_row], ignore_index=True)
                     
                     added_str.append(f"{ing_name}({amount}{item.get('unit')})")
-                    reduce_shopping_list(ing_name, amount) # 追加分だけ買出しリストから減らす
+                    reduce_shopping_list(ing_name, amount)
                     
                 st.session_state.df_Inventory = inv_df
                 save_to_excel()
@@ -429,19 +427,29 @@ with tab_consume:
         st.rerun()
 
 # ------------------------------------------
-# Tab 5: マスターデータ管理 (純粋な保存処理のみ)
+# Tab 5: マスターデータ管理 
 # ------------------------------------------
 with tab_manage:
     sub_inv, sub_staple, sub_seasoning, sub_premade = st.tabs(["📦 在庫表", "🥛 定番品", "🧂 調味料", "🍛 便利レトルト"])
     
     with sub_inv:
-        edited_inv = st.data_editor(st.session_state.df_Inventory, num_rows="dynamic", use_container_width=True, key="ed_inv")
+        # ①の対策: 在庫表のカテゴリと単位に入力規則(プルダウン)を設定
+        edited_inv = st.data_editor(st.session_state.df_Inventory, num_rows="dynamic", use_container_width=True, key="ed_inv",
+            column_config={
+                "カテゴリ": st.column_config.SelectboxColumn(options=CATEGORY_OPTIONS),
+                "単位": st.column_config.SelectboxColumn(options=UNIT_OPTIONS)
+            })
         if not edited_inv.equals(st.session_state.df_Inventory):
             st.session_state.df_Inventory = edited_inv
             save_to_excel()
 
     with sub_staple:
-        edited_staple = st.data_editor(st.session_state.df_Staples, num_rows="dynamic", use_container_width=True, key="ed_sta")
+        # ①の対策: 定番品のカテゴリと単位に入力規則(プルダウン)を設定
+        edited_staple = st.data_editor(st.session_state.df_Staples, num_rows="dynamic", use_container_width=True, key="ed_sta",
+            column_config={
+                "カテゴリ": st.column_config.SelectboxColumn(options=CATEGORY_OPTIONS),
+                "単位": st.column_config.SelectboxColumn(options=UNIT_OPTIONS)
+            })
         if not edited_staple.equals(st.session_state.df_Staples):
             st.session_state.df_Staples = edited_staple
             save_to_excel()

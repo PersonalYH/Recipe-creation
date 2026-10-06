@@ -205,12 +205,11 @@ with tab_create:
     target_days = st.number_input("何日分作成しますか？", min_value=1, max_value=7, value=3)
     
     req_prompt = ""
-    # ②の対策: 在庫消費優先時はレシピ提案数を15品に大幅拡大（エラー回避の安全圏）
     if mode == "在庫消費優先":
         sorted_df = st.session_state.df_Inventory.sort_values(by="購入日", ascending=True)
         st.dataframe(sorted_df[["購入日", "食材名", "残量", "単位"]].head(5), use_container_width=True, hide_index=True)
         req_prompt = f"在庫データ(古い順): {sorted_df.to_json(orient='records', force_ascii=False)}\n"
-        num_proposals = 15 
+        num_proposals = target_days * 5 
     else:
         reqs = [st.text_input(f"Day {d+1} のリクエスト", key=f"r_{d}") for d in range(int(target_days))]
         req_prompt = f"リクエスト: {reqs}\n"
@@ -221,7 +220,6 @@ with tab_create:
             hi_rates = st.session_state.df_Ratings[st.session_state.df_Ratings["評価"] >= 4]["レシピ名"].tolist()
             premades = st.session_state.df_PremadeSauces.to_json(orient='records', force_ascii=False)
             
-            # ③の対策: 家にある調味料のリストを抽出し、AIに読み込ませる
             stocked_seasonings = st.session_state.df_Seasonings[st.session_state.df_Seasonings["在庫あり"] == True]["調味料名"].tolist()
             
             sys_prompt = f"""
@@ -348,7 +346,6 @@ with tab_shop:
     if len(st.session_state.df_ShoppingList) == 0:
         st.info("買い出しが必要な食材はありません。")
     else:
-        # ①の対策: 買出しリストのカテゴリと単位にも入力規則(プルダウン)を設定
         edited_shop = st.data_editor(st.session_state.df_ShoppingList, num_rows="dynamic", use_container_width=True, key="ed_shop",
             column_config={
                 "買出済": st.column_config.CheckboxColumn("買出済", default=False), 
@@ -433,7 +430,6 @@ with tab_manage:
     sub_inv, sub_staple, sub_seasoning, sub_premade = st.tabs(["📦 在庫表", "🥛 定番品", "🧂 調味料", "🍛 便利レトルト"])
     
     with sub_inv:
-        # ①の対策: 在庫表のカテゴリと単位に入力規則(プルダウン)を設定
         edited_inv = st.data_editor(st.session_state.df_Inventory, num_rows="dynamic", use_container_width=True, key="ed_inv",
             column_config={
                 "カテゴリ": st.column_config.SelectboxColumn(options=CATEGORY_OPTIONS),
@@ -444,7 +440,6 @@ with tab_manage:
             save_to_excel()
 
     with sub_staple:
-        # ①の対策: 定番品のカテゴリと単位に入力規則(プルダウン)を設定
         edited_staple = st.data_editor(st.session_state.df_Staples, num_rows="dynamic", use_container_width=True, key="ed_sta",
             column_config={
                 "カテゴリ": st.column_config.SelectboxColumn(options=CATEGORY_OPTIONS),
